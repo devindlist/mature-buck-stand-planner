@@ -44,6 +44,12 @@ const active = (features: MapFeature[]) => features.filter((f) => f.status === '
 
 const DEFAULT_RADIUS_M = 60;
 
+/**
+ * Every bedding area the engine infers (prob >= this) is real enough to protect:
+ * the wind gate, setbacks and route judging all use this same floor.
+ */
+export const BEDDING_MIN_PROB = 0.25;
+
 function polygonRadius(points: Vec[]): number {
   return Math.max(25, Math.sqrt(polygonArea(points) / Math.PI));
 }
@@ -175,7 +181,7 @@ export function inferBedding(features: MapFeature[], sightings: Sighting[]): Bed
       });
     }
   }
-  return out.filter((b) => b.probability >= 0.25);
+  return out.filter((b) => b.probability >= BEDDING_MIN_PROB);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,6 +209,9 @@ export const CROP_ATTRACTION: Record<CropType, PhaseRow> = {
   winter_wheat: row(0.5, 0.65, 0.6, 0.45, 0.4, 0.65, 0.7),
   brassicas: row(0.2, 0.35, 0.45, 0.4, 0.4, 0.75, 1.0),
   unknown: row(0.7, 0.55, 0.55, 0.45, 0.4, 0.7, 0.8),
+  // Stage unknown: typical Midwest progression (green → standing → harvested/left standing).
+  corn: row(0.4, 0.6, 0.55, 0.45, 0.4, 0.65, 0.85),
+  soybeans: row(0.95, 0.45, 0.45, 0.4, 0.35, 0.6, 0.8),
 };
 export const MAST_ATTRACTION: PhaseRow = row(0.55, 0.9, 0.8, 0.5, 0.4, 0.45, 0.25);
 export const FOOD_PLOT_ATTRACTION: PhaseRow = row(0.8, 0.7, 0.65, 0.5, 0.45, 0.75, 0.9);

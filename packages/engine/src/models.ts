@@ -119,6 +119,9 @@ export interface Geometry {
 export type FeatureSource = 'vision' | 'user' | 'elevation' | 'landcover' | 'inferred';
 
 export type CropType =
+  /** Crop known, stage not: resolved by date/phase at plan time (e.g. from USDA CDL). */
+  | 'corn'
+  | 'soybeans'
   | 'corn_standing'
   | 'corn_picked'
   | 'soybeans_green'
@@ -237,6 +240,8 @@ export interface Property {
   stands: Stand[];
   cameras: Camera[];
   accessConstraints: AccessConstraint[];
+  /** How the map's features were produced. 'mock' = demo detections, not from this photo. */
+  analysisMode?: 'mock' | 'proxy' | 'manual';
   /** Spots where the hunter dismissed an engine-generated stand; never proposed again. */
   dismissedCandidatePositions?: Vec[];
   createdAt: ISODateTime;
@@ -320,6 +325,8 @@ export interface WeatherSnapshot {
   hourly?: HourlyWind[];
   /** Field names the hunter overrode by hand. Manual values always win. */
   overriddenFields: string[];
+  /** True when no forecast was available and values are defaults the hunter has not confirmed. */
+  placeholder?: boolean;
   shortForecast?: string;
 }
 
@@ -493,6 +500,11 @@ export interface StandRecommendation {
   safetyReminders: string[];
   /** Scent plumes at this stand for the map (wind and, in light wind, thermals). */
   plumes: Array<{ kind: 'wind' | 'thermal_falling' | 'thermal_rising' | 'swirl'; bearingDeg: number; halfAngleDeg: number; lengthM: number }>;
+  /**
+   * Set only on a wind-shift fallback backup: the hypothetical wind (FROM, degrees) this
+   * recommendation was evaluated for. UI must label the dial/plume as "if wind is X".
+   */
+  assumedWindFromDeg?: number;
 }
 
 export interface EliminatedStand {

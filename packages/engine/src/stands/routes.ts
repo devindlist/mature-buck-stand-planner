@@ -375,7 +375,10 @@ function assembleRoute(kind: WalkKind, start: AccessStart, path: Vec[], judge: S
 export interface RoutePair {
   entry: Route | null;
   exit: Route | null;
+  /** No access point, road or boundary to start from. */
   noAccess: boolean;
+  /** Start points exist, but no legal walking route reaches the stand (water, no-access zone, off-property). */
+  unreachable: boolean;
 }
 
 export interface RoutePlanner {
@@ -392,14 +395,14 @@ export function createRoutePlanner(ctx: RouteContext, extraPoints: Vec[] = []): 
   return {
     plan(stand: Vec): RoutePair {
       const starts = accessStarts(ctx.property, stand);
-      if (starts.length === 0) return { entry: null, exit: null, noAccess: true };
+      if (starts.length === 0) return { entry: null, exit: null, noAccess: true, unreachable: false };
 
       let bestEntry: { start: AccessStart; path: Vec[]; cost: number } | null = null;
       for (const st of starts) {
         const r = astar(entryGrid, st.position, stand);
         if (r && (!bestEntry || r.cost < bestEntry.cost)) bestEntry = { start: st, path: r.path, cost: r.cost };
       }
-      if (!bestEntry) return { entry: null, exit: null, noAccess: true };
+      if (!bestEntry) return { entry: null, exit: null, noAccess: false, unreachable: true };
 
       // Penalize re-using the entry path on the way out (outside the stand and truck zones).
       const penalty = new Float64Array(exitGrid.cols * exitGrid.rows);
@@ -430,7 +433,7 @@ export function createRoutePlanner(ctx: RouteContext, extraPoints: Vec[] = []): 
         exit.overlapWithOther = overlap;
         if (overlap > 0.6) exit.notes.push('Terrain forces the exit back along your entry path. Go extra slow and quiet.');
       }
-      return { entry, exit, noAccess: false };
+      return { entry, exit, noAccess: false, unreachable: false };
     },
   };
 }
