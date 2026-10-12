@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 860" font-family="Helvetica,Arial,sans-serif">
+<rect width="1000" height="860" fill="#1d2a1f"/>
+<polyline points="-0.0,768.0 1000.0,768.0" fill="none" stroke="#bbbbbb" stroke-width="6" />
+<circle cx="80.0" cy="720.0" r="9" fill="#111" stroke="#F2B33D" stroke-width="2"/><text x="92" y="724" fill="#eee" font-size="13">Farmhouse</text>
+<circle cx="620.0" cy="752.0" r="9" fill="#111" stroke="#F2B33D" stroke-width="2"/><text x="632" y="756" fill="#eee" font-size="13">Field gate</text>
+<polygon points="350.0,496.0 700.0,496.0 700.0,400.0 950.0,400.0 950.0,720.0 350.0,720.0" fill="#c9d46a" fill-opacity="0.35" stroke="#c9d46a" stroke-width="2"/>
+<circle cx="700.0" cy="496.0" r="9" fill="#111" stroke="#F2B33D" stroke-width="2"/><text x="712" y="500" fill="#eee" font-size="13">Inside corner</text>
+<polyline points="350.0,496.0 700.0,496.0 700.0,400.0 950.0,400.0" fill="none" stroke="#a9b4ad" stroke-width="3" />
+<polyline points="50.0,176.0 300.0,144.0 550.0,168.0 800.0,136.0 980.0,160.0" fill="none" stroke="#e2b97f" stroke-width="3" stroke-dasharray="12 6"/>
+<circle cx="550.0" cy="168.0" r="9" fill="#111" stroke="#F2B33D" stroke-width="2"/><text x="562" y="172" fill="#eee" font-size="13">Saddle</text>
+<polyline points="720.0,240.0 880.0,224.0" fill="none" stroke="#e2b97f" stroke-width="3" />
+<polygon points="720.0,176.0 920.0,176.0 920.0,304.0 720.0,304.0" fill="#6b4a2b" fill-opacity="0.55" stroke="#6b4a2b" stroke-width="2"/>
+<polygon points="100.0,360.0 280.0,360.0 280.0,480.0 100.0,480.0" fill="#6b4a2b" fill-opacity="0.55" stroke="#6b4a2b" stroke-width="2"/>
+<polygon points="400.0,240.0 620.0,240.0 620.0,368.0 400.0,368.0" fill="#5f8f3a" fill-opacity="0.35" stroke="#5f8f3a" stroke-width="2"/>
+<polyline points="-0.0,560.0 150.0,544.0 300.0,576.0 340.0,656.0 330.0,768.0" fill="none" stroke="#5ab4e8" stroke-width="3" />
+<circle cx="150.0" cy="544.0" r="9" fill="#111" stroke="#F2B33D" stroke-width="2"/><text x="162" y="548" fill="#eee" font-size="13">Crossing</text>
+<circle cx="320.0" cy="416.0" r="9" fill="#111" stroke="#F2B33D" stroke-width="2"/><text x="332" y="420" fill="#eee" font-size="13">Funnel</text>
+<polygon points="200.0,672.0 270.0,672.0 270.0,720.0 200.0,720.0" fill="#5ab4e8" fill-opacity="0.35" stroke="#5ab4e8" stroke-width="2"/>
+<polygon points="720.0,176.0 920.0,176.0 920.0,304.0 720.0,304.0" fill="none" stroke="#ff9a5a" stroke-width="3" stroke-dasharray="6 4"/><text x="820.0" y="240.0" fill="#ffcfa8" font-size="14" text-anchor="middle">buck bedding</text>
+<polygon points="100.0,360.0 280.0,360.0 280.0,480.0 100.0,480.0" fill="none" stroke="#ff9a5a" stroke-width="3" stroke-dasharray="6 4"/><text x="190.0" y="420.0" fill="#ffcfa8" font-size="14" text-anchor="middle">doe bedding</text>
+<polyline points="350.0,496.0 700.0,496.0 700.0,400.0 950.0,400.0" fill="none" stroke="#F2B33D" stroke-opacity="0.68709" stroke-width="4.32254" stroke-dasharray="10 6"/>
+<polyline points="388.1,420.0 190.0,618.1" fill="none" stroke="#F2B33D" stroke-opacity="0.67" stroke-width="4.220000000000001" stroke-dasharray="10 6"/>
+<polyline points="720.0,240.0 880.0,224.0" fill="none" stroke="#F2B33D" stroke-opacity="0.52275" stroke-width="3.3365" stroke-dasharray="10 6"/>
+<polyline points="50.0,176.0 300.0,144.0 550.0,168.0 800.0,136.0 980.0,160.0" fill="none" stroke="#F2B33D" stroke-opacity="0.50493" stroke-width="3.22958" stroke-dasharray="10 6"/>
+<polyline points="720.0,304.0 320.0,416.0 280.0,360.0" fill="none" stroke="#F2B33D" stroke-opacity="0.4991016677018526" stroke-width="3.1946100062111156" stroke-dasharray="10 6"/>
+<polyline points="-0.0,560.0 150.0,544.0 300.0,576.0 340.0,656.0 330.0,768.0" fill="none" stroke="#F2B33D" stroke-opacity="0.493545" stroke-width="3.16127" stroke-dasharray="10 6"/>
+<polyline points="720.0,304.0 820.0,400.0" fill="none" stroke="#F2B33D" stroke-opacity="0.4254961118444165" stroke-width="2.7529766710664987" stroke-dasharray="10 6"/>
+<polyline points="280.0,480.0 320.0,416.0 350.0,496.0" fill="none" stroke="#F2B33D" stroke-opacity="0.39474485921664326" stroke-width="2.5684691552998595" stroke-dasharray="10 6"/>
+<polygon points="64.1,564.7 258.3,655.2 251.5,668.5 243.8,681.4 235.3,693.6 225.8,705.2 215.6,716.2 204.7,726.4 193.1,735.8 180.8,744.4 168.0,752.1 154.7,758.9" fill="#ffffff" fill-opacity="0.12" stroke="#fff" stroke-opacity="0.5"/>
+<polyline points="620.0,752.0 600.0,770.6 573.2,770.6 546.4,770.6 535.7,781.3 498.2,781.3 460.7,781.3 423.2,781.3 385.7,781.3 348.2,781.3 310.7,781.3 289.3,759.9 262.5,759.9 235.7,759.9 214.3,738.4 192.9,717.0 192.9,695.6 167.1,669.4 141.4,643.2 115.6,617.0 89.9,590.8 64.1,564.7" fill="none" stroke="#4CC27A" stroke-width="5" stroke-linecap="round" />
+<polyline points="64.1,564.7 75.0,577.7 117.9,577.7 139.3,599.1 160.7,620.6 182.1,642.0 214.3,642.0 246.4,642.0 275.9,671.5 305.4,700.9 334.8,730.4 364.3,759.9 406.9,758.5 449.5,757.2 492.1,755.9 534.8,754.6 577.4,753.3 620.0,752.0" fill="none" stroke="#4CC27A" stroke-width="5" stroke-linecap="round" stroke-dasharray="12 8"/>
+<circle cx="64.1" cy="564.7" r="15" fill="#E8792B" stroke="#111" stroke-width="3"/><text x="64.1" y="569.7" fill="#111" font-size="15" font-weight="bold" text-anchor="middle">1</text>
+<circle cx="151.2" cy="555.4" r="15" fill="#E8792B" stroke="#111" stroke-width="3"/><text x="151.2" y="560.4" fill="#111" font-size="15" font-weight="bold" text-anchor="middle">2</text>
+<circle cx="185.7" cy="563.3" r="15" fill="#E8792B" stroke="#111" stroke-width="3"/><text x="185.7" y="568.3" fill="#111" font-size="15" font-weight="bold" text-anchor="middle">3</text>
+<circle cx="247.6" cy="576.6" r="15" fill="#888" stroke="#111" stroke-width="3"/><text x="247.6" y="581.6" fill="#111" font-size="15" font-weight="bold" text-anchor="middle">B</text>
+<rect x="0" y="800" width="1000" height="60" fill="#0e1110"/><text x="16" y="826" fill="#f1f4ef" font-size="16" font-weight="bold">Mock farm · Seeking &amp; chasing · PM · NW 9 mph (scent → SE)</text><text x="16" y="848" fill="#a9b4ad" font-size="13">#1 Creek · W 77  ·  #2 Creek crossing 69  ·  #3 Creek · W 2 69  ·  B Downwind cruise · SW 82  ·  #1 routes: solid = entry, dashed = exit (green safe / amber caution / red avoid)</text><g><circle cx="930" cy="60" r="40" fill="#0e1110" stroke="#33403a"/><line x1="910.2010101267766" y1="40.20101012677667" x2="949.7989898732234" y2="79.79898987322332" stroke="#fff" stroke-width="5"/><circle cx="949.7989898732234" cy="79.79898987322332" r="6" fill="#fff"/><text x="930" y="118" fill="#fff" font-size="12" text-anchor="middle">scent</text></g>
+</svg>

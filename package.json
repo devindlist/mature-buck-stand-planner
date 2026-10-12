@@ -1,0 +1,19 @@
+{
+  "name": "mature-buck-stand-planner",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "server/*"
+  ],
+  "scripts": {
+    "test": "npm run test -w @msp/engine && npm run test -w @msp/vision-proxy",
+    "typecheck": "npm run typecheck -w @msp/engine && npm run typecheck -w @msp/mobile && npm run typecheck -w @msp/vision-proxy",
+    "mobile": "npm run start -w @msp/mobile",
+    "proxy": "npm run dev -w @msp/vision-proxy"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}

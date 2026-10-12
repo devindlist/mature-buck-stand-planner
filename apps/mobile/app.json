@@ -1,0 +1,50 @@
+{
+  "expo": {
+    "name": "Mature Buck Stand Planner",
+    "slug": "mature-buck-stand-planner",
+    "scheme": "standplanner",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0E1110",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "com.maturebuck.standplanner",
+      "supportsTablet": false,
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Your location centers the map, fills the forecast for your hunting spot, and lets you drop sightings where you are. It never leaves your phone unless you share.",
+        "NSPhotoLibraryUsageDescription": "Pick a map screenshot or aerial photo of your property to plan stands on.",
+        "NSCameraUsageDescription": "Photograph a paper map of your property.",
+        "NSMicrophoneUsageDescription": "Dictate your post-hunt notes.",
+        "UIBackgroundModes": []
+      }
+    },
+    "android": {
+      "package": "com.maturebuck.standplanner",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "POST_NOTIFICATIONS",
+        "SCHEDULE_EXACT_ALARM",
+        "VIBRATE"
+      ],
+      "blockedPermissions": ["android.permission.RECORD_AUDIO"]
+    },
+    "plugins": [
+      "expo-router",
+      "expo-secure-store",
+      ["expo-sqlite", { "useSQLCipher": true }],
+      ["expo-location", { "locationWhenInUsePermission": "Your location centers the map and fills the forecast for your hunting spot." }],
+      ["expo-image-picker", { "photosPermission": "Pick a map screenshot or aerial photo of your property.", "cameraPermission": "Photograph a paper map of your property." }],
+      ["expo-notifications", { "sounds": [] }],
+      "@maplibre/maplibre-react-native"
+    ],
+    "experiments": {
+      "typedRoutes": false
+    },
+    "extra": {
+      "visionProxyUrl": "",
+      "nwsUserAgent": "MatureBuckStandPlanner/0.1 (support@example.com)"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install engine + proxy dev tooling
+        run: npm install --workspace @msp/engine --workspace @msp/vision-proxy --include-workspace-root=false
+      - name: Engine typecheck (src + tests)
+        run: npm run typecheck --workspace @msp/engine
+      - name: Engine tests
+        run: npm test --workspace @msp/engine
+      - name: Proxy tests
+        run: npm test --workspace @msp/vision-proxy
+      - name: Proxy typecheck
+        run: npm run typecheck --workspace @msp/vision-proxy

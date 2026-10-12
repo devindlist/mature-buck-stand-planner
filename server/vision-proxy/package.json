@@ -1,0 +1,23 @@
+{
+  "name": "@msp/vision-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reference proxy: receives a map photo from the app, asks Claude for terrain features as structured JSON, returns validated results. Keeps the Anthropic API key off the phone.",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch src/server.ts",
+    "start": "node src/server.ts",
+    "test": "node --test \"src/**/*.test.ts\"",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "latest"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "~5.8.0"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
