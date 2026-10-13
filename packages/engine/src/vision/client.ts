@@ -23,12 +23,56 @@ export interface VisionResponse {
   model?: string;
 }
 
+/**
+ * How long the app waits for the proxy, upload and analysis included. The proxy cancels its
+ * Claude call after its own deadline (server/vision-proxy VISION_TIMEOUT_MS, default 240 s,
+ * never above 270 s), so this must stay comfortably above that: otherwise the app gives up
+ * while the proxy keeps working, the hunter retries, and every attempt is billed and counted
+ * against the hourly limit with no result reaching the phone.
+ */
+export const DEFAULT_VISION_TIMEOUT_MS = 300_000;
+
+/**
+ * Largest image Claude's high-resolution vision tier takes (Opus 4.7 and later, including the
+ * proxy's default claude-opus-5-5): 2576 px on the long edge and about 3.75 MP in total, with
+ * coordinates mapping 1:1 to pixels. Older models, or a VISION_MODEL override, downscale larger
+ * images themselves (1568 px on Opus 4.6 and earlier), so sending this size is safe either way.
+ */
+export const MAX_VISION_EDGE_PX = 2576;
+export const MAX_VISION_PIXELS = 3_750_000;
+
+/**
+ * Largest base64 payload the app should send. Keeps the decoded JPEG under the API's 5 MB
+ * per-image cap; the proxy (validate.ts MAX_IMAGE_BASE64_CHARS) rejects anything larger.
+ */
+export const MAX_VISION_BASE64_CHARS = 6_600_000;
+
+export interface FittedImage {
+  width: number;
+  height: number;
+  /** True when width/height are smaller than the input and the photo needs resizing. */
+  resized: boolean;
+}
+
+/**
+ * Size to downscale a photo to before sending it: never upscales, keeps the aspect ratio, and
+ * stays within both the long-edge and total-pixel limits of the vision tier.
+ */
+export function fitVisionImage(width: number, height: number): FittedImage {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return { width, height, resized: false };
+  const scale = Math.min(1, MAX_VISION_EDGE_PX / Math.max(width, height), Math.sqrt(MAX_VISION_PIXELS / (width * height)));
+  if (scale >= 1) return { width, height, resized: false };
+  // The epsilon absorbs float error (2796 * (2576 / 2796) can land a hair under 2576).
+  return { width: Math.max(1, Math.floor(width * scale + 1e-6)), height: Math.max(1, Math.floor(height * scale + 1e-6)), resized: true };
+}
+
 export interface VisionClientOptions {
   mode: VisionMode;
   proxyUrl?: string;
   /** Per-install token the proxy checks; not an Anthropic key. */
   appToken?: string;
   fetchFn?: typeof fetch;
+  /** Total wait for the proxy. Default DEFAULT_VISION_TIMEOUT_MS; keep it above the proxy's own deadline. */
   timeoutMs?: number;
   mockDelayMs?: number;
 }
@@ -50,7 +94,7 @@ export async function analyzeMapPhoto(req: VisionRequest, opts: VisionClientOpti
   if (!opts.proxyUrl) throw new VisionError('No vision proxy configured. Use mock mode or set a proxy URL in Settings.', false);
   const fetchFn = opts.fetchFn ?? fetch;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 120_000);
+  const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? DEFAULT_VISION_TIMEOUT_MS);
   try {
     const res = await fetchFn(`${opts.proxyUrl.replace(/\/$/, '')}/v1/analyze-map`, {
       method: 'POST',
@@ -65,7 +109,7 @@ export async function analyzeMapPhoto(req: VisionRequest, opts: VisionClientOpti
   } catch (e) {
     if (e instanceof VisionError) throw e;
     const aborted = (e as { name?: string }).name === 'AbortError';
-    throw new VisionError(aborted ? 'Map analysis timed out. Try again with signal, or use mock mode.' : 'Could not reach the vision proxy. Check your connection.', true);
+    throw new VisionError(aborted ? 'Map analysis timed out. Try again with a stronger signal or a less cluttered screenshot, or mark features by hand.' : 'Could not reach the vision proxy. Check your connection.', true);
   } finally {
     clearTimeout(timer);
   }

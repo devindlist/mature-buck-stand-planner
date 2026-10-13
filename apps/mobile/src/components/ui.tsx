@@ -99,6 +99,28 @@ export function Segmented<T extends string>({ options, value, onChange, labels }
   );
 }
 
+/**
+ * A selectable pill for choice lists (crop, phase, shape). Always at least TOUCH tall so a
+ * gloved thumb hits it; the selected state is a thick accent border plus a check, never colour alone.
+ */
+export function Chip({ label, selected, onPress, accessibilityLabel, style }: { label: string; selected?: boolean; onPress: () => void; accessibilityLabel?: string; style?: StyleProp<ViewStyle> }) {
+  const t = useTheme();
+  return (
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel ?? label}
+      accessibilityState={{ selected: !!selected }}
+      onPress={onPress}
+      style={[styles.chipBtn, { borderColor: selected ? t.accent : t.border, borderWidth: selected ? 2.5 : 1.5, backgroundColor: selected ? t.surfaceAlt : 'transparent' }, style]}
+    >
+      <Text style={{ color: t.text, fontSize: font.sm, fontWeight: selected ? '800' : '600' }}>
+        {selected ? '✓ ' : ''}
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
 export function Stepper({ label, value, onChange, step = 1, min = 0, max = 999, unit, badge }: { label: string; value: number; onChange: (v: number) => void; step?: number; min?: number; max?: number; unit?: string; badge?: string }) {
   const t = useTheme();
   const btn = (delta: number, txt: string) => (
@@ -184,5 +206,6 @@ const styles = StyleSheet.create({
   row: { flexDirection: 'row', alignItems: 'center', gap: 10, marginVertical: 6 },
   stepBtn: { width: TOUCH, height: TOUCH, borderRadius: RADIUS, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
   chip: { flexDirection: 'row', alignItems: 'center', borderWidth: 1.5, borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4, alignSelf: 'flex-start' },
+  chipBtn: { minHeight: TOUCH, paddingHorizontal: 14, justifyContent: 'center', borderRadius: 12 },
   card: { borderWidth: 1, borderRadius: RADIUS, padding: SPACE + 2, marginVertical: 6 },
 });

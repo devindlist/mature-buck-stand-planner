@@ -4,9 +4,13 @@ import Svg, { Circle, G, Line, Path, Polygon, Polyline, Text as SvgText } from '
 import {
   add,
   bearingVec,
+  geometryCentroid,
   localToPixel,
+  pointAlong,
+  polylineLength,
   scale as vscale,
   sectorPolygon,
+  type AccessConstraint,
   type Calibration,
   type FeatureType,
   type HabitatSummary,
@@ -18,6 +22,7 @@ import {
 } from '@msp/engine';
 import { useTheme } from '../theme/ThemeContext';
 import type { Theme } from '../theme/theme';
+import { StatusGlyph } from './Icons';
 
 /**
  * The calibrated photo with everything drawn on top, in SVG. Works fully offline and
@@ -33,6 +38,15 @@ export interface MapStand {
   selected?: boolean;
   status?: 'go' | 'caution' | 'no_go';
   existing?: boolean;
+  /** Removed by the hunter (shown only while "Show dismissed" is on): drawn faded with a dashed ring. */
+  dimmed?: boolean;
+}
+
+export interface MapCamera {
+  id: string;
+  position: Vec;
+  label: string;
+  selected?: boolean;
 }
 
 export interface PhotoMapProps {
@@ -43,8 +57,14 @@ export interface PhotoMapProps {
   features?: MapFeature[];
   habitat?: HabitatSummary;
   stands?: MapStand[];
+  cameras?: MapCamera[];
+  /** The hunter's access constraints: no-access zones, must-use gates, neighbor lines. */
+  constraints?: AccessConstraint[];
+  selectedConstraintId?: string | null;
   routes?: Route[];
   plumes?: { origin: Vec; plumes: StandRecommendation['plumes'] };
+  /** A shape being drawn (local meters): previewed as a dashed outline (closed) or line. */
+  draft?: { points: Vec[]; closed: boolean };
   /** Raw photo pixels (calibration taps), drawn as numbered pins. */
   pins?: Array<{ pixel: PixelPoint; label: string }>;
   selectedFeatureId?: string | null;
@@ -52,6 +72,8 @@ export interface PhotoMapProps {
   onPressPixel?: (p: PixelPoint) => void;
   onPressStand?: (id: string) => void;
   onPressFeature?: (id: string) => void;
+  onPressCamera?: (id: string) => void;
+  onPressConstraint?: (id: string) => void;
 }
 
 export function featureColor(t: Theme, type: FeatureType): string {
@@ -83,7 +105,7 @@ export function featureColor(t: Theme, type: FeatureType): string {
   }
 }
 
-const POINT_GLYPH: Partial<Record<FeatureType, string>> = {
+export const POINT_GLYPH: Partial<Record<FeatureType, string>> = {
   saddle: 'S',
   funnel: 'F',
   creek_crossing: 'X',
@@ -136,6 +158,43 @@ export function PhotoMap(props: PhotoMapProps) {
           <Polyline key={c.id} points={pts(c.points)} fill="none" stroke={t.map.corridor} strokeOpacity={0.35 + c.strength * 0.6} strokeWidth={2 + c.strength * 4} strokeDasharray="10 6" />
         ))}
 
+        {/* Access constraints the hunter drew: no-access zones, gates, neighbor lines. Under the features, so a feature inside a zone stays tappable. */}
+        {props.constraints?.map((c) => {
+          if (!c.geometry?.points?.length) return null;
+          const sel = c.id === props.selectedConstraintId;
+          const press = props.onPressConstraint ? () => props.onPressConstraint?.(c.id) : undefined;
+          const color = c.kind === 'no_access_zone' ? t.status.avoid : t.status.caution;
+          const stroke = sel ? t.map.standSelected : color;
+          if (c.geometry.kind === 'point') {
+            const p = toScreen(c.geometry.points[0]);
+            return (
+              <G key={c.id} onPress={press}>
+                <Circle cx={p.x} cy={p.y} r={13} fill={t.bg} fillOpacity={0.85} stroke={stroke} strokeWidth={sel ? 3.5 : 2.5} />
+                <SvgText x={p.x} y={p.y + 4} fontSize={11} fontWeight="bold" fill={color} textAnchor="middle">
+                  {c.kind === 'must_use_gate' ? 'G' : '!'}
+                </SvgText>
+              </G>
+            );
+          }
+          const c0 = toScreen(geometryCentroid(c.geometry));
+          const word = c.kind === 'no_access_zone' ? 'NO ACCESS' : c.kind === 'neighbor_line' ? 'NEIGHBOR' : c.kind === 'must_use_gate' ? 'GATE' : 'RESTRICTED';
+          return (
+            <G key={c.id}>
+              {c.geometry.kind === 'polygon' ? (
+                <Polygon points={pts(c.geometry.points)} fill={color} fillOpacity={0.14} stroke={stroke} strokeWidth={sel ? 4 : 2.5} strokeDasharray="3 3" onPress={press} />
+              ) : (
+                <Polyline points={pts(c.geometry.points)} fill="none" stroke={stroke} strokeWidth={sel ? 5 : 3.5} strokeDasharray="8 4" onPress={press} />
+              )}
+              <SvgText x={c0.x} y={c0.y + 4} fontSize={11} fontWeight="bold" fill={t.bg} stroke={t.bg} strokeWidth={3} textAnchor="middle">
+                {word}
+              </SvgText>
+              <SvgText x={c0.x} y={c0.y + 4} fontSize={11} fontWeight="bold" fill={color} textAnchor="middle" onPress={press}>
+                {word}
+              </SvgText>
+            </G>
+          );
+        })}
+
         {/* Detected / hunter features */}
         {features.map((f) => {
           const color = featureColor(t, f.type);
@@ -151,6 +210,7 @@ export function PhotoMap(props: PhotoMapProps) {
           const p = toScreen(f.geometry.points[0]);
           return (
             <G key={f.id} onPress={press} opacity={dim}>
+              <Circle cx={p.x} cy={p.y} r={26} fill="transparent" />
               <Circle cx={p.x} cy={p.y} r={sel ? 13 : 11} fill={t.bg} fillOpacity={0.8} stroke={sel ? t.map.standSelected : color} strokeWidth={2.5} />
               <SvgText x={p.x} y={p.y + 4} fontSize={11} fontWeight="bold" fill={color} textAnchor="middle">
                 {POINT_GLYPH[f.type] ?? '•'}
@@ -192,25 +252,69 @@ export function PhotoMap(props: PhotoMapProps) {
             />
           )),
         )}
+        {/* Status that never depends on colour: a caution (!) or avoid (X) icon on every non-safe stretch */}
+        {props.routes?.map((r) =>
+          r.segments.flatMap((s, i) => {
+            if (s.status === 'safe' || s.points.length < 2) return [];
+            const mid = toScreen(pointAlong(s.points, polylineLength(s.points) / 2).point);
+            return [<StatusGlyph key={`rg-${r.kind}-${i}`} status={s.status} cx={mid.x} cy={mid.y} r={9} color={t.status[s.status]} bg={t.bg} />];
+          }),
+        )}
         {props.routes?.map((r) => {
           const p = toScreen(r.kind === 'entry' ? r.points[0] : r.points[r.points.length - 1]);
-          return <Circle key={`start-${r.kind}`} cx={p.x} cy={p.y} r={7} fill={r.kind === 'entry' ? t.route.entry : t.route.exit} stroke={t.bg} strokeWidth={2} />;
+          const word = r.kind === 'entry' ? 'IN' : 'OUT';
+          return (
+            <G key={`start-${r.kind}`}>
+              <Circle cx={p.x} cy={p.y} r={7} fill={r.kind === 'entry' ? t.route.entry : t.route.exit} stroke={t.bg} strokeWidth={2} />
+              <SvgText x={p.x + 11} y={p.y - 9} fontSize={11} fontWeight="bold" fill={t.bg} stroke={t.bg} strokeWidth={3}>
+                {word}
+              </SvgText>
+              <SvgText x={p.x + 11} y={p.y - 9} fontSize={11} fontWeight="bold" fill={r.kind === 'entry' ? t.route.entry : t.route.exit}>
+                {word}
+              </SvgText>
+            </G>
+          );
+        })}
+
+        {/* Cameras */}
+        {props.cameras?.map((c) => {
+          const p = toScreen(c.position);
+          const stroke = c.selected ? t.map.standSelected : t.text;
+          return (
+            <G key={c.id} onPress={props.onPressCamera ? () => props.onPressCamera?.(c.id) : undefined}>
+              <Circle cx={p.x} cy={p.y} r={22} fill="transparent" />
+              <Path d={`M${p.x - 10},${p.y - 6} h20 v12 h-20 z`} fill={t.bg} fillOpacity={0.85} stroke={stroke} strokeWidth={c.selected ? 3 : 2} strokeLinejoin="round" />
+              <Circle cx={p.x} cy={p.y} r={3.2} fill="none" stroke={stroke} strokeWidth={2} />
+              <Path d={`M${p.x - 4},${p.y - 9} h8`} stroke={stroke} strokeWidth={2.5} strokeLinecap="round" />
+            </G>
+          );
         })}
 
         {/* Stands */}
         {props.stands?.map((s) => {
           const p = toScreen(s.position);
           const r = s.selected ? 17 : 14;
+          const statusColor = s.status ? t.status[s.status === 'go' ? 'safe' : s.status === 'no_go' ? 'avoid' : 'caution'] : undefined;
           return (
-            <G key={s.id} onPress={props.onPressStand ? () => props.onPressStand?.(s.id) : undefined}>
-              <Circle cx={p.x} cy={p.y} r={r + 8} fill="transparent" />
-              <Circle cx={p.x} cy={p.y} r={r} fill={s.selected ? t.map.standSelected : t.map.stand} stroke={t.bg} strokeWidth={2.5} />
+            <G key={s.id} opacity={s.dimmed ? 0.45 : 1} onPress={props.onPressStand ? () => props.onPressStand?.(s.id) : undefined}>
+              <Circle cx={p.x} cy={p.y} r={Math.max(28, r + 12)} fill="transparent" />
+              <Circle cx={p.x} cy={p.y} r={r} fill={s.selected ? t.map.standSelected : t.map.stand} stroke={t.bg} strokeWidth={2.5} strokeDasharray={s.dimmed ? '4 3' : undefined} />
               <SvgText x={p.x} y={p.y + 5} fontSize={14} fontWeight="bold" fill={t.accentText} textAnchor="middle">
                 {s.rank ? (s.rank === 4 ? 'B' : String(s.rank)) : s.existing ? '★' : '•'}
               </SvgText>
+              {s.status && statusColor ? <StatusGlyph status={s.status} cx={p.x + r * 0.85} cy={p.y - r * 0.85} r={8} color={statusColor} bg={t.bg} /> : null}
             </G>
           );
         })}
+
+        {/* A shape being drawn */}
+        {props.draft && props.draft.points.length >= 2 ? (
+          props.draft.closed && props.draft.points.length >= 3 ? (
+            <Polygon points={pts(props.draft.points)} fill={t.accent} fillOpacity={0.15} stroke={t.accent} strokeWidth={2.5} strokeDasharray="6 4" />
+          ) : (
+            <Polyline points={pts(props.draft.points)} fill="none" stroke={t.accent} strokeWidth={3} strokeDasharray="6 4" />
+          )
+        ) : null}
 
         {/* Calibration pins */}
         {props.pins?.map((pin, i) => {

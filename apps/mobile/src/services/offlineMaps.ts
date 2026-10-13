@@ -1,5 +1,8 @@
-import { OfflineManager } from '@maplibre/maplibre-react-native';
+import * as FileSystem from 'expo-file-system';
+import * as MapLibre from '@maplibre/maplibre-react-native';
 import { boundsOf, localToGeo, type Property } from '@msp/engine';
+
+const { OfflineManager } = MapLibre;
 
 /**
  * USGS National Map basemaps (public domain, no API key) and offline packs.
@@ -47,24 +50,99 @@ export function propertyBoundsLngLat(p: Property): [[number, number], [number, n
 
 export const packName = (p: Property, kind: BasemapKind) => `msp-${p.id}-${kind}`;
 
+/** Folder (under the documents directory) that holds the style files offline packs are built from. */
+const STYLE_DIR = 'styles/';
+
+/**
+ * Writes the basemap style to a file and returns its file:// URL.
+ *
+ * MapLibre's offline downloader defines a region by a style URL: it fetches that style to
+ * learn which tiles to download. maplibre-react-native's OfflineCreatePackOptions requires
+ * `styleURL` (it throws "Style URL must be provided" without one) and has no option that
+ * takes style JSON, so the JSON goes to a file. The map itself loads the same tile URL
+ * templates, so the cached tiles are hit when there is no signal.
+ */
+export async function writeStyleFile(kind: BasemapKind): Promise<string> {
+  const docs: string | null | undefined = FileSystem.documentDirectory;
+  if (!docs) throw new Error('App storage is not available, so the offline basemap cannot be saved.');
+  const dir = `${docs}${STYLE_DIR}`;
+  await FileSystem.makeDirectoryAsync(dir, { intermediates: true });
+  const uri = `${dir}usgs-${kind}.json`;
+  await FileSystem.writeAsStringAsync(uri, JSON.stringify(usgsStyle(kind)));
+  return uri;
+}
+
+/** No progress event for this long means the download is stuck (no signal, app paused). */
+const STALL_MS = 90_000;
+
+interface PackStatus {
+  state?: number | string;
+  percentage: number;
+  completedResourceCount?: number;
+  requiredResourceCount?: number;
+  completedTileCount?: number;
+}
+
+/** MapLibre's "download complete" state constant, when this library version exports it. */
+const COMPLETE_STATE = (MapLibre as unknown as { OfflinePackDownloadState?: { Complete?: number | string } }).OfflinePackDownloadState?.Complete;
+
+/**
+ * True when a progress event says the download has finished. The library's Complete state
+ * is authoritative: the percentage can read 100 early (the style alone is one finished
+ * resource out of one known), long before the tiles are even listed.
+ */
+export function packDownloadFinished(status: PackStatus, completeState: number | string | undefined = COMPLETE_STATE): boolean {
+  if (completeState !== undefined) return status.state === completeState;
+  return status.percentage >= 100 && (status.completedResourceCount ?? 0) >= (status.requiredResourceCount ?? Infinity) && (status.completedTileCount ?? 0) > 0;
+}
+
 /**
  * Download zooms 12–16 for the property (typically 2–15 MB for a farm).
- * Progress is reported 0..100.
+ * Progress is reported 0..100. Resolves only when tiles were really saved; rejects with a
+ * plain message on any failure (bad style, no signal, no progress for 90 s) so the caller
+ * never reports "ready" for a pack that has no map in it.
  */
 export async function downloadOfflinePack(p: Property, kind: BasemapKind, onProgress: (pct: number) => void): Promise<void> {
   const bounds = propertyBoundsLngLat(p);
   if (!bounds) throw new Error('Geo-reference the map (two reference points) to download offline basemaps.');
   const name = packName(p, kind);
+  const styleURL = await writeStyleFile(kind);
   const existing = await OfflineManager.getPack(name);
   if (existing) await OfflineManager.deletePack(name);
   await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      if (watchdog) clearTimeout(watchdog);
+      try {
+        OfflineManager.unsubscribe(name);
+      } catch {
+        /* nothing subscribed */
+      }
+      if (err) reject(err);
+      else resolve();
+    };
+    const arm = () => {
+      if (watchdog) clearTimeout(watchdog);
+      watchdog = setTimeout(() => finish(new Error('The download stopped making progress. Check your signal and try again.')), STALL_MS);
+    };
+    arm();
+    // createPack is async: a rejected promise (bad options, native failure) must reach the caller.
     OfflineManager.createPack(
-      { name, mapStyle: JSON.stringify(usgsStyle(kind)), bounds, minZoom: 12, maxZoom: 16, metadata: { propertyId: p.id } },
-      (_pack: unknown, status: { percentage: number; state?: number | string }) => {
-        onProgress(Math.round(status.percentage));
-        if (status.percentage >= 100) resolve();
+      { name, styleURL, bounds, minZoom: 12, maxZoom: 16, metadata: { propertyId: p.id } },
+      (_pack: unknown, status: PackStatus) => {
+        arm();
+        onProgress(Number.isFinite(status.percentage) ? Math.max(0, Math.min(100, Math.round(status.percentage))) : 0);
+        if (!packDownloadFinished(status)) return;
+        if (!((status.completedTileCount ?? 0) > 0)) {
+          finish(new Error('The download finished but saved no map tiles, so the offline basemap would be blank. Try again on a good connection.'));
+          return;
+        }
+        finish();
       },
-      (_pack: unknown, err: { message: string }) => reject(new Error(err.message)),
-    );
+      (_pack: unknown, err: { message?: string }) => finish(new Error(err?.message || 'The offline map download failed.')),
+    ).catch((e: unknown) => finish(e instanceof Error ? e : new Error(String(e))));
   });
 }

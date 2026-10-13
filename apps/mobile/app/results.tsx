@@ -1,8 +1,8 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, FlatList, Pressable, Text, useWindowDimensions, View, type ViewToken } from 'react-native';
 import { Redirect, router } from 'expo-router';
-import { pixelToLocal, compass16, type PixelPoint, type Stand, type StandRecommendation } from '@msp/engine';
-import { useAppStore } from '../src/state/store';
+import { compass16, geoToLocal, pixelToLocal, type LatLon, type PixelPoint, type Plan, type PlanInputs, type Property, type Stand, type StandRecommendation, type Vec } from '@msp/engine';
+import { useAppStore, type PlanDraft } from '../src/state/store';
 import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Screen, Segmented } from '../src/components/ui';
 import { PhotoMap, type MapStand } from '../src/components/PhotoMap';
@@ -13,7 +13,28 @@ import { StatusIcon } from '../src/components/Icons';
 import { runPlan } from '../src/services/planning';
 import { saveProperty } from '../src/db/repos';
 import { uid } from '../src/utils/format';
-import { font, SPACE } from '../src/theme/theme';
+import { font, SPACE, TOUCH } from '../src/theme/theme';
+
+/** The stands the cards and the map show, in card order: top 3, backup, then the hunter's own. */
+const recsOf = (p: Plan): StandRecommendation[] => [...p.recommendations, ...(p.backup ? [p.backup] : []), ...(p.yourStands ?? [])];
+
+/**
+ * A re-plan answers the same question as the plan on screen: its own date, window, weapon,
+ * range, phase and setback overrides. The live draft on Plan may have moved on (or been reset
+ * after a relaunch), and must not change what this plan is about. The weather already has the
+ * hunter's overrides applied, so none are re-applied.
+ */
+function draftFromInputs(i: PlanInputs): PlanDraft {
+  return {
+    date: i.date,
+    window: i.window,
+    weaponType: i.weapon.type,
+    rangeYds: i.weapon.effectiveRangeYds,
+    phaseOverride: i.phaseOverride,
+    setbackOverrideM: i.beddingSetbackOverrideM,
+    overrides: {},
+  };
+}
 
 /**
  * Results: map first. Swipe the cards; the map follows. Tap a stand on the map to jump
@@ -25,7 +46,7 @@ export default function Results() {
   const planState = useAppStore((s) => s.plan);
   const property = useAppStore((s) => s.properties.find((p) => p.id === s.plan?.plan.propertyId) ?? null);
   const draft = useAppStore((s) => s.draft);
-  const weather = useAppStore((s) => s.weather);
+  const liveWeather = useAppStore((s) => s.weather);
   const selectedStandId = useAppStore((s) => s.selectedStandId);
   const set = useAppStore((s) => s.set);
   const upsertProperty = useAppStore((s) => s.upsertProperty);
@@ -35,11 +56,12 @@ export default function Results() {
   const [busy, setBusy] = useState(false);
   const [showEliminated, setShowEliminated] = useState(false);
   const listRef = useRef<FlatList<StandRecommendation>>(null);
+  /** Synchronous lock: a state flag lags a render behind, so a fast second tap could slip past it. */
+  const replanning = useRef(false);
+  /** The stand whose card must be showing once the re-planned list is on screen. */
+  const focusAfterReplan = useRef<string | null>(null);
 
-  const recs = useMemo(
-    () => (planState ? [...planState.plan.recommendations, ...(planState.plan.backup ? [planState.plan.backup] : []), ...(planState.plan.yourStands ?? [])] : []),
-    [planState],
-  );
+  const recs = useMemo(() => (planState ? recsOf(planState.plan) : []), [planState]);
   const isYours = (r: StandRecommendation) => !!planState?.plan.yourStands?.includes(r);
   const selected = recs.find((r) => r.stand.id === selectedStandId) ?? recs[0];
 
@@ -48,38 +70,84 @@ export default function Results() {
     if (first) useAppStore.getState().set({ selectedStandId: first.stand.id });
   }).current;
 
+  // After a re-plan the list has new data but keeps its old scroll offset, and the visible card
+  // may keep its key (a moved stand keeps its id), so no viewability event would follow. Scroll to
+  // the acted-on stand so the card, the map highlight, routes and plume all belong together.
+  useEffect(() => {
+    const id = focusAfterReplan.current;
+    if (!id) return;
+    focusAfterReplan.current = null;
+    const i = recs.findIndex((r) => r.stand.id === id);
+    if (i < 0) return;
+    try {
+      listRef.current?.scrollToIndex({ index: i, animated: false });
+    } catch {
+      /* the list is not laid out yet; the selection above still drives the map */
+    }
+  }, [recs]);
+
   if (!planState || !property?.calibration || !property.mapImageUri) return <Redirect href="/" />;
   const { plan } = planState;
   const cal = property.calibration;
   const geo = !!cal.originGeo;
 
-  const replan = async (next: typeof property) => {
-    if (!weather) return;
+  /**
+   * Saves the changed property and re-plans it from this plan's own inputs. One at a time:
+   * taps that arrive while a re-plan runs are ignored. On failure nothing is half-applied
+   * (the property is put back) and the hunter is told.
+   */
+  const replan = async (next: Property, focusId: string | null) => {
+    if (replanning.current) return;
+    replanning.current = true;
     setBusy(true);
+    const before = property;
+    let saved: Property | null = null;
     try {
-      const saved = await saveProperty(next);
+      saved = await saveProperty(next);
       upsertProperty(saved);
-      const result = await runPlan(saved, draft, plan.inputs.weather ?? weather, plan.inputs.location);
-      set({ plan: result, selectedStandId: result.plan.recommendations[0]?.stand.id ?? null });
+      const i = plan.inputs;
+      const result = await runPlan(saved, draftFromInputs(i), i.weather, i.location);
+      const nextRecs = recsOf(result.plan);
+      const keep = focusId && nextRecs.some((r) => r.stand.id === focusId) ? focusId : (nextRecs[0]?.stand.id ?? null);
+      focusAfterReplan.current = keep;
+      set({ plan: result, selectedStandId: keep });
+      const out = focusId ? result.plan.eliminated.find((e) => e.stand.id === focusId) : undefined;
+      if (out) Alert.alert(`${out.stand.name} is not huntable`, out.reasons.join(' ') || 'It failed the wind or safety checks.');
+    } catch (e) {
+      if (saved) {
+        // Put the stands back as they were so the saved map matches the plan on screen.
+        try {
+          upsertProperty(await saveProperty(before));
+        } catch {
+          /* the original error below is the one to report */
+        }
+      }
+      Alert.alert('Re-plan failed', `${e instanceof Error ? e.message : 'Something went wrong.'} Your stands were left as they were.`);
     } finally {
+      replanning.current = false;
       setBusy(false);
     }
   };
 
-  const onMapTap = (px: PixelPoint) => {
-    if (!moving) return;
-    const p = pixelToLocal(cal, px);
+  /** Where a moved stand should go, in local meters. */
+  const placeMoved = (p: Vec) => {
+    if (!moving || replanning.current) return;
     const s = moving.stand;
     // Moving any stand makes it the hunter's own: it is always evaluated from now on.
     const mine: Stand = s.origin === 'existing' ? { ...s, position: p } : { id: uid('stand'), propertyId: property.id, name: s.name, position: p, origin: 'existing', type: s.type };
     const stands = s.origin === 'existing' ? property.stands.map((x) => (x.id === s.id ? mine : x)) : [...property.stands, mine];
     const dismissed = s.origin === 'generated' ? [...(property.dismissedCandidatePositions ?? []), s.position] : property.dismissedCandidatePositions;
     setMoving(null);
-    void replan({ ...property, stands, dismissedCandidatePositions: dismissed });
+    void replan({ ...property, stands, dismissedCandidatePositions: dismissed }, mine.id);
+  };
+  const onMapTap = (px: PixelPoint) => placeMoved(pixelToLocal(cal, px));
+  const onBasemapTap = (at: LatLon) => {
+    if (cal.originGeo) placeMoved(geoToLocal(at, cal.originGeo));
   };
 
   const dismiss = (rec: StandRecommendation) => {
-    Alert.alert(`Dismiss ${rec.stand.name}?`, 'The plan will re-run without it. You can restore it from the map editor.', [
+    if (replanning.current) return;
+    Alert.alert(`Dismiss ${rec.stand.name}?`, 'The plan will re-run without it. You can restore it from the map editor (Removed stands).', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Dismiss',
@@ -90,6 +158,7 @@ export default function Results() {
             s.origin === 'existing'
               ? { ...property, stands: property.stands.map((x) => (x.id === s.id ? { ...x, dismissed: true } : x)) }
               : { ...property, dismissedCandidatePositions: [...(property.dismissedCandidatePositions ?? []), s.position] },
+            null,
           );
         },
       },
@@ -106,16 +175,45 @@ export default function Results() {
     status: r.decision.status,
   }));
   const routes = selected ? [selected.entryRoute, selected.exitRoute].filter((r): r is NonNullable<typeof r> => !!r) : [];
-  const mapH = height * 0.42;
+  const mapFeatures = property.features.filter((f) => ['road', 'house', 'access_point', 'saddle', 'funnel', 'creek_crossing', 'inside_corner'].includes(f.type));
+  const plumes = selected ? { origin: selected.stand.position, plumes: selected.plumes } : undefined;
+  const mock = property.analysisMode === 'mock';
+  const mapH = height * (mock ? 0.38 : 0.42);
   const cardW = width;
 
   const banner = plan.warnings.find((w) => w.level === 'no_go') ?? plan.warnings.find((w) => w.level === 'caution');
 
+  // The wind arrow at top right follows the Plan screen; this plan was made with its own wind.
+  const planWind = plan.inputs.weather;
+  const badgeFrom = draft.overrides.windFromDeg ?? liveWeather?.windFromDeg;
+  const windMoved = badgeFrom !== undefined && compass16(badgeFrom) !== compass16(planWind.windFromDeg);
+  const assumed = selected?.assumedWindFromDeg;
+
   return (
     <Screen title={`${plan.inputs.window} · ${plan.phase.label}`} onBack={() => router.back()} scroll={false}>
+      {mock ? (
+        <View accessible accessibilityRole="alert" accessibilityLabel="Mock analysis. Sample features, not from your photo." style={{ backgroundColor: t.surfaceAlt, borderBottomWidth: 2, borderBottomColor: t.status.caution, paddingHorizontal: SPACE, paddingVertical: 6, flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          <StatusIcon status="caution" color={t.status.caution} size={22} />
+          <Text style={{ color: t.status.caution, fontSize: font.sm, fontWeight: '900' }}>MOCK ANALYSIS</Text>
+          <Text style={{ color: t.text, fontSize: font.xs, flex: 1 }} numberOfLines={2}>
+            Sample features, not from your photo. Review the map before you trust this plan.
+          </Text>
+        </View>
+      ) : null}
       <View style={{ height: mapH, overflow: 'hidden' }}>
         {layer === 'basemap' && geo ? (
-          <GeoMap property={property} basemap="imageryTopo" habitat={plan.habitat} stands={mapStands} routes={routes} onPressStand={(id) => jumpTo(id)} />
+          <GeoMap
+            property={property}
+            basemap="imageryTopo"
+            habitat={plan.habitat}
+            features={mapFeatures}
+            constraints={property.accessConstraints}
+            stands={mapStands}
+            routes={routes}
+            plumes={plumes}
+            onPressStand={moving ? undefined : (id) => jumpTo(id)}
+            onPressMap={moving ? onBasemapTap : undefined}
+          />
         ) : (
           <PhotoMap
             imageUri={property.mapImageUri}
@@ -123,14 +221,21 @@ export default function Results() {
             width={width}
             maxHeight={mapH}
             habitat={plan.habitat}
-            features={property.features.filter((f) => ['road', 'house', 'access_point', 'saddle', 'funnel', 'creek_crossing', 'inside_corner'].includes(f.type))}
+            features={mapFeatures}
+            constraints={property.accessConstraints}
             stands={mapStands}
             routes={routes}
-            plumes={selected ? { origin: selected.stand.position, plumes: selected.plumes } : undefined}
+            plumes={plumes}
             onPressStand={moving ? undefined : (id) => jumpTo(id)}
             onPressPixel={moving ? onMapTap : undefined}
           />
         )}
+        {assumed !== undefined ? (
+          <View accessible accessibilityLabel={`Scent plume drawn for a ${compass16(assumed)} wind, not today’s forecast`} style={{ position: 'absolute', left: 8, top: 8, flexDirection: 'row', alignItems: 'center', gap: 6, backgroundColor: t.bg + 'E6', borderRadius: 10, borderWidth: 1.5, borderColor: t.status.caution, paddingHorizontal: 8, paddingVertical: 4, maxWidth: '80%' }}>
+            <StatusIcon status="caution" color={t.status.caution} size={16} />
+            <Text style={{ color: t.text, fontSize: font.xs, fontWeight: '800', flexShrink: 1 }}>Plume and dial: if wind is {compass16(assumed)} (not today’s forecast)</Text>
+          </View>
+        ) : null}
         <View style={{ position: 'absolute', left: 8, bottom: 8, flexDirection: 'row', gap: 6 }}>
           <Legend color={t.status.safe} label="safe" status="safe" />
           <Legend color={t.status.caution} label="caution" status="caution" />
@@ -140,9 +245,13 @@ export default function Results() {
       {moving ? (
         <View style={{ backgroundColor: t.accent, padding: 10, flexDirection: 'row', alignItems: 'center' }}>
           <Text style={{ color: t.accentText, fontWeight: '800', flex: 1 }}>Tap the map where {moving.stand.name} should go</Text>
-          <Pressable onPress={() => setMoving(null)} style={{ minHeight: 44, justifyContent: 'center', paddingHorizontal: 10 }}>
+          <Pressable accessibilityRole="button" accessibilityLabel="Cancel move" onPress={() => setMoving(null)} style={{ minHeight: TOUCH, justifyContent: 'center', paddingHorizontal: 14 }}>
             <Text style={{ color: t.accentText, fontWeight: '900' }}>Cancel</Text>
           </Pressable>
+        </View>
+      ) : busy ? (
+        <View accessibilityLiveRegion="polite" style={{ backgroundColor: t.accent, padding: 10 }}>
+          <Text style={{ color: t.accentText, fontWeight: '800' }}>Re-planning with your change…</Text>
         </View>
       ) : banner ? (
         <View style={{ backgroundColor: t.surfaceAlt, paddingHorizontal: SPACE, paddingVertical: 6, flexDirection: 'row', gap: 6, alignItems: 'center' }}>
@@ -159,12 +268,23 @@ export default function Results() {
             <Segmented options={['photo', 'basemap'] as const} value={layer} onChange={setLayer} labels={{ photo: 'Photo', basemap: 'USGS map' }} />
           </View>
         ) : (
-          <Text style={{ color: t.textDim, fontSize: font.xs, flex: 1 }}>Wind {compass16(plan.inputs.weather.windFromDeg)} · solid = entry, dashed = exit</Text>
+          <View style={{ flex: 1 }} />
         )}
         <Text style={{ color: t.textDim, fontSize: font.xs }}>
           {recs.findIndex((r) => r.stand.id === selected?.stand.id) + 1}/{recs.length}
         </Text>
       </View>
+      <Text style={{ color: t.textDim, fontSize: font.xs, paddingHorizontal: SPACE, paddingTop: 4 }}>
+        Plan wind {compass16(planWind.windFromDeg)} {Math.round(planWind.windSpeedMph)} mph · solid = entry (IN), dashed = exit (OUT)
+      </Text>
+      {windMoved ? (
+        <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center', paddingHorizontal: SPACE, paddingTop: 2 }}>
+          <StatusIcon status="caution" color={t.status.caution} size={16} />
+          <Text style={{ color: t.status.caution, fontSize: font.xs, fontWeight: '700', flex: 1 }}>
+            The wind badge now shows {compass16(badgeFrom!)}; this plan used {compass16(planWind.windFromDeg)}. Plan again to use the newer wind.
+          </Text>
+        </View>
+      ) : null}
 
       {recs.length === 0 ? (
         <View style={{ padding: SPACE }}>
@@ -188,8 +308,11 @@ export default function Results() {
               rec={item}
               title={isYours(item) ? `Your stand · ${item.stand.name}` : undefined}
               width={cardW}
+              busy={busy}
               onScorePress={(key) => setSheet({ rec: item, key })}
-              onMove={() => setMoving(item)}
+              onMove={() => {
+                if (!replanning.current) setMoving(item);
+              }}
               onDismiss={() => dismiss(item)}
               onHunt={() => router.push({ pathname: '/hunt', params: { standId: item.stand.id } })}
             />
@@ -199,7 +322,7 @@ export default function Results() {
 
       <View style={{ flexDirection: 'row', gap: 8, paddingHorizontal: SPACE }}>
         <BigButton label="Plan card" kind="secondary" onPress={() => router.push('/plan-card')} style={{ flex: 1 }} />
-        <BigButton label={`Eliminated (${plan.eliminated.length})`} kind="ghost" onPress={() => setShowEliminated((v) => !v)} style={{ flex: 1 }} loading={busy} />
+        <BigButton label={`Eliminated (${plan.eliminated.length})`} kind="ghost" onPress={() => setShowEliminated((v) => !v)} style={{ flex: 1 }} />
       </View>
       {showEliminated ? (
         <View style={{ maxHeight: 180, paddingHorizontal: SPACE, paddingBottom: SPACE }}>
@@ -223,7 +346,11 @@ export default function Results() {
     const i = recs.findIndex((r) => r.stand.id === id);
     if (i >= 0) {
       set({ selectedStandId: id });
-      listRef.current?.scrollToIndex({ index: i, animated: true });
+      try {
+        listRef.current?.scrollToIndex({ index: i, animated: true });
+      } catch {
+        /* list not laid out yet; the map selection still moved */
+      }
     }
   }
 }

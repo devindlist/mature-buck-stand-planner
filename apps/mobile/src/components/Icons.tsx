@@ -1,12 +1,15 @@
 import React from 'react';
-import Svg, { Circle, Line, Path, Polygon } from 'react-native-svg';
+import Svg, { Circle, G, Line, Path, Polygon } from 'react-native-svg';
 import type { Status } from '@msp/engine';
 
-/** Status icons: shape carries meaning, so red-light mode (all red) still reads. */
-export function StatusIcon({ status, color, size = 20 }: { status: Status | 'go' | 'no_go'; color: string; size?: number }) {
-  const s = status === 'go' ? 'safe' : status === 'no_go' ? 'avoid' : status;
+type Shape = 'safe' | 'caution' | 'avoid';
+
+const toShape = (status: Status | 'go' | 'no_go'): Shape => (status === 'go' ? 'safe' : status === 'no_go' ? 'avoid' : status);
+
+/** The three status shapes in a 24x24 box: check in a circle, ! in a triangle, X in an octagon. */
+function StatusShapes({ s, color }: { s: Shape; color: string }) {
   return (
-    <Svg width={size} height={size} viewBox="0 0 24 24" accessibilityRole="image">
+    <>
       {s === 'safe' && (
         <>
           <Circle cx={12} cy={12} r={10} stroke={color} strokeWidth={2.5} fill="none" />
@@ -26,7 +29,35 @@ export function StatusIcon({ status, color, size = 20 }: { status: Status | 'go'
           <Path d="M8.5 8.5l7 7M15.5 8.5l-7 7" stroke={color} strokeWidth={2.8} strokeLinecap="round" />
         </>
       )}
+    </>
+  );
+}
+
+/** Status icons: shape carries meaning, so red-light mode (all red) still reads. */
+export function StatusIcon({ status, color, size = 20 }: { status: Status | 'go' | 'no_go'; color: string; size?: number }) {
+  const s = toShape(status);
+  return (
+    <Svg width={size} height={size} viewBox="0 0 24 24" accessibilityRole="image">
+      <StatusShapes s={s} color={color} />
     </Svg>
+  );
+}
+
+/**
+ * A status icon drawn INSIDE an SVG map (PhotoMap), centred on (cx, cy) with a solid
+ * backing disc so it reads over photos. Same shapes as StatusIcon, so status never
+ * depends on colour alone.
+ */
+export function StatusGlyph({ status, cx, cy, r = 9, color, bg }: { status: Status | 'go' | 'no_go'; cx: number; cy: number; r?: number; color: string; bg: string }) {
+  const s = toShape(status);
+  const k = (r * 2) / 24;
+  return (
+    <G>
+      <Circle cx={cx} cy={cy} r={r + 1.5} fill={bg} fillOpacity={0.92} />
+      <G transform={`translate(${cx - r} ${cy - r}) scale(${k})`}>
+        <StatusShapes s={s} color={color} />
+      </G>
+    </G>
   );
 }
 

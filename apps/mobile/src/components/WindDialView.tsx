@@ -9,7 +9,7 @@ import { font } from '../theme/theme';
  * 16-sector wind dial: each wedge is a wind FROM that direction.
  * Good = solid, caution = hatched outline, bad = X-marked: readable without color.
  */
-export function WindDialView({ dial, size = 150 }: { dial: WindDial; size?: number }) {
+export function WindDialView({ dial, size = 150, assumedFromDeg }: { dial: WindDial; size?: number; /** Set on a wind-shift backup: the arrow shows a hypothetical wind, not today's forecast. */ assumedFromDeg?: number }) {
   const t = useTheme();
   const c = size / 2;
   const rOuter = c - 14;
@@ -24,7 +24,7 @@ export function WindDialView({ dial, size = 150 }: { dial: WindDial; size?: numb
   const bad = dial.sectors.filter((s) => s.status === 'bad').map((s) => compass16(s.fromDeg));
   const arrowRot = downwindBearing(dial.currentFromDeg);
   return (
-    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }} accessible accessibilityLabel={`Good winds: ${good.join(', ') || 'none'}. Bad winds: ${bad.join(', ') || 'none'}.`}>
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }} accessible accessibilityLabel={`${assumedFromDeg !== undefined ? `If the wind is ${compass16(assumedFromDeg)}, not today's forecast. ` : ''}Good winds: ${good.join(', ') || 'none'}. Bad winds: ${bad.join(', ') || 'none'}.`}>
       <Svg width={size} height={size}>
         {dial.sectors.map((s) => {
           const color = t.dial[s.status];
@@ -59,6 +59,9 @@ export function WindDialView({ dial, size = 150 }: { dial: WindDial; size?: numb
         </G>
       </Svg>
       <View style={{ flex: 1 }}>
+        {assumedFromDeg !== undefined ? (
+          <Text style={{ color: t.status.caution, fontWeight: '800', fontSize: font.sm, marginBottom: 6 }}>! If wind is {compass16(assumedFromDeg)} (arrow shows this, not today’s forecast)</Text>
+        ) : null}
         <Text style={{ color: t.status.safe, fontWeight: '800', fontSize: font.sm }}>✓ Good</Text>
         <Text style={{ color: t.text, fontSize: font.sm, marginBottom: 6 }}>{good.join(' ') || 'none'}</Text>
         <Text style={{ color: t.status.avoid, fontWeight: '800', fontSize: font.sm }}>✕ Bad</Text>
