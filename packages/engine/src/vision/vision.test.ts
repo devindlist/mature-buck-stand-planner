@@ -6,6 +6,10 @@ import { analyzeMapPhoto, VisionError } from './client.ts';
 import { crossCheckFeatures, cropFromCdl, nlcdCheck, sampleElevationGrid, type LandDataProvider } from './crossCheck.ts';
 import { calibrationFromNorthAndScale } from '../calibration/calibration.ts';
 import { geoToLocal } from '../geo/localFrame.ts';
+import { cropForPlanning, inferFood } from '../inference/habitat.ts';
+
+/** The planner's food floor for the wind gate (planner.ts FOOD_SENSITIVE_MIN). */
+const FOOD_GATE_MIN = 0.3;
 import type { LatLon, MapFeature } from '../models.ts';
 import { FEATURE_TYPES } from '../models.ts';
 
@@ -115,7 +119,7 @@ test('3DEP confirms a real ridge and saddle; rejects a fake ridge', async () => 
   assert.ok(byId.s.confidence > 0.5, 'saddle confirmed');
   assert.ok(byId.a.confidence > 0.5, 'NLCD 82 agrees with ag field');
   assert.ok(byId.t.confidence < 0.5, 'NLCD 82 disagrees with thick cover');
-  assert.equal(byId.a.attributes?.crop, 'soybeans_standing', 'CDL 2025 corn → rotation → beans in 2026');
+  assert.equal(byId.a.attributes?.crop, 'soybeans', 'CDL 2025 corn → rotation → beans in 2026 (family only; stage is resolved at plan time)');
   assert.ok(byId.r.attributes?.crossCheck?.[0].source === '3DEP');
 });
 
@@ -133,9 +137,32 @@ test('NLCD and CDL lookups', () => {
   assert.equal(nlcdCheck('thick_cover', 41)?.agrees, true);
   assert.equal(nlcdCheck('water', 82)?.agrees, false);
   assert.equal(nlcdCheck('ridge', 41), null);
-  assert.equal(cropFromCdl(5, 2026, '2026-09-20')?.crop, 'soybeans_green');
+  assert.equal(cropFromCdl(5, 2026, '2026-09-20')?.crop, 'soybeans');
+  assert.equal(cropFromCdl(1, 2025, '2026-09-20')?.crop, 'soybeans', 'last year corn → beans this year');
+  assert.equal(cropFromCdl(5, 2025, '2026-11-20')?.crop, 'corn', 'last year beans → corn this year');
   assert.equal(cropFromCdl(36, 2025, '2026-11-01')?.crop, 'alfalfa_clover');
   assert.equal(cropFromCdl(999, 2025, '2026-11-01'), null);
+});
+
+test('a CDL crop guessed in September keeps its food value through the season', async () => {
+  const cal = calibrationFromNorthAndScale({ imageWidth: 1000, imageHeight: 1000, northRotationDeg: 0, metersPerPixel: 1, originGeo: ORIGIN });
+  const field = { ...feat('a', 'ag_field', [{ x: 0, y: -300 }, { x: 300, y: -300 }, { x: 300, y: -100 }, { x: 0, y: -100 }], 'polygon'), confidence: 0.8 };
+  // Calibrated 2026-09-20; CDL 2025 shows corn, so beans this year.
+  const [checked] = await crossCheckFeatures([field], cal, provider, '2026-09-20');
+  assert.equal(checked.attributes?.crop, 'soybeans');
+  const unknown = { ...checked, attributes: { ...checked.attributes, crop: 'unknown' as const } };
+  for (const phase of ['pre_rut', 'seeking_chasing', 'post_rut', 'late_season'] as const) {
+    const [food] = inferFood([checked], phase);
+    assert.ok(food && food.probability >= FOOD_GATE_MIN, `${phase}: ${food?.probability} must still count for the wind gate`);
+    assert.ok(food.probability >= 0.75 * inferFood([unknown], phase)[0].probability, `${phase}: about as strong as an unknown crop`);
+  }
+  // Older builds froze 'soybeans_green' from CDL. Unconfirmed, it is read as the family…
+  const legacy = { ...checked, attributes: { ...checked.attributes, crop: 'soybeans_green' as const } };
+  assert.equal(cropForPlanning(legacy), 'soybeans');
+  assert.ok(inferFood([legacy], 'pre_rut')[0].probability >= FOOD_GATE_MIN);
+  // …but a crop the hunter set is never overridden.
+  assert.equal(cropForPlanning({ ...legacy, userEdited: true }), 'soybeans_green');
+  assert.equal(cropForPlanning({ ...legacy, source: 'user' }), 'soybeans_green');
 });
 
 test('elevation grid sampler produces a full grid', async () => {

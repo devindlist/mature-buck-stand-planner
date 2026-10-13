@@ -4,6 +4,7 @@ import type {
   Decision,
   EliminatedStand,
   HabitatSummary,
+  HourlyWind,
   Modifier,
   Plan,
   PlanInputs,
@@ -23,13 +24,13 @@ import type {
   WeatherSnapshot,
   ShotPlan,
 } from './models.ts';
-import { bearingTo, circlePolygon, compass16, dist, downwindBearing, mToYds, normDeg, pointGeometryDistance, slicePolyline, polylineLength, projectOntoPolyline, round } from './geo/geometry.ts';
+import { angleDiff, bearingTo, circlePolygon, compass16, dist, downwindBearing, mToYds, normDeg, pointGeometryDistance, slicePolyline, polylineLength, projectOntoPolyline, round, ydsToM } from './geo/geometry.ts';
 import { derivePhase, AM_HOLD_MIN, BEDDING_SETBACK_M, PM_SETTLE_MIN, PHASE_TACTICS } from './season/phase.ts';
 import { addMinutes, legalHours, sunTimes } from './astro/sun.ts';
-import { inferHabitat } from './inference/habitat.ts';
+import { BEDDING_MIN_PROB, inferHabitat } from './inference/habitat.ts';
 import { generateCandidates, type Candidate, effectiveSetback } from './stands/candidates.ts';
-import { createRoutePlanner, type RoutePair } from './stands/routes.ts';
-import { directionSpread, evaluateGate, LIGHT_WIND_MPH, scentModel, windMargin, type GateResult, type ScentModel, type SensitiveArea, type WindState } from './wind/scent.ts';
+import { createRoutePlanner, type RoutePair, type RoutePlanner } from './stands/routes.ts';
+import { directionSpread, evaluateGate, LIGHT_WIND_MPH, scentModel, windMargin, type GateResult, type PlumeHit, type ScentModel, type SensitiveArea, type WindState } from './wind/scent.ts';
 import { slopeAt, type SlopeInfo, type TerrainModel } from './terrain/terrain.ts';
 import {
   relevantSightings,
@@ -50,9 +51,19 @@ import { moonModifier, pressureModifier } from './modifiers/modifiers.ts';
 
 export const ENGINE_VERSION = '0.1.0';
 export const MIN_PICK_SPACING_M = 100;
+/** Food at least this likely to be fed in this sit is a hard wind-gate area. */
 export const FOOD_SENSITIVE_MIN = 0.3;
+/**
+ * Food the engine keeps (and builds travel toward) but that is less likely to be fed:
+ * scent drifting into it is a caution and a wind-fit penalty, not an elimination.
+ */
+export const FOOD_SOFT_MIN = 0.15;
 /** A backup must be good in at least this many 22.5° wind sectors where the #1 stand is bad. */
 export const MIN_BACKUP_EXTRA_SECTORS = 2;
+/** A forecast hour at least one compass sector off today's wind is a forecast shift (NWS gives 16-point directions). */
+export const FORECAST_SHIFT_DEG = 22.5;
+/** Risk text for a stand no legal route reaches (the plan card keys off it). */
+export const UNREACHABLE_RISK = 'No legal walking route from your access points. A no-access zone, water or the boundary blocks every path in.';
 
 export interface PlanRequest {
   property: Property;
@@ -94,7 +105,8 @@ export function sitWindow(inputs: PlanInputs, phase: Plan['phase']['phase'], sun
 function baseSensitiveAreas(habitat: HabitatSummary, inputs: PlanInputs): SensitiveArea[] {
   const out: SensitiveArea[] = [];
   for (const b of habitat.bedding) {
-    if (b.probability < 0.4) continue;
+    // Every bed the engine maps (and builds travel from) is protected by the gate.
+    if (b.probability < BEDDING_MIN_PROB) continue;
     out.push({
       id: b.id,
       kind: 'bedding',
@@ -106,29 +118,42 @@ function baseSensitiveAreas(habitat: HabitatSummary, inputs: PlanInputs): Sensit
   }
   for (const f of habitat.food) {
     // Any food deer are likely to visit this sit counts: scent rolling into the field
-    // you're hunting gets you busted by the first doe that steps out.
-    if (f.probability < FOOD_SENSITIVE_MIN) continue;
+    // you're hunting gets you busted by the first doe that steps out. Less likely food
+    // is still flagged (soft: caution and a wind-fit penalty) rather than ignored.
+    if (f.probability < FOOD_SOFT_MIN) continue;
     out.push({
       id: f.id,
       kind: 'food',
       label: f.kind === 'ag' ? 'the field' : f.kind === 'mast' ? 'the acorns' : 'the food plot',
       shape: f.polygon ?? circlePolygon(f.center, f.radiusM),
       closed: true,
-      hardRangeM: inputs.window === 'PM' ? 200 : 150,
+      hardRangeM: f.probability < FOOD_SENSITIVE_MIN ? SOFT_ONLY : inputs.window === 'PM' ? 200 : 150,
     });
   }
   return out;
+}
+
+/** hardRangeM for an area that only ever raises a caution, even for a stand inside it. */
+const SOFT_ONLY = 0;
+
+/** The wind gate, with soft-only areas never counted as a hard (eliminating) hit. */
+function gateAt(origin: Vec, model: ScentModel, areas: SensitiveArea[]): GateResult {
+  const g = evaluateGate(origin, model, areas);
+  if (!g.hits.some((h) => h.hard && h.area.hardRangeM <= SOFT_ONLY)) return g;
+  const hits = g.hits.map((h) => (h.area.hardRangeM <= SOFT_ONLY ? { ...h, hard: false } : h));
+  return { passes: !hits.some((h) => h.hard), hits };
 }
 
 /**
  * The deer's approach path for this sit: where they come FROM toward the stand.
  * Bed→food corridors are ordered bedding-first: PM deer come from the bedding end,
  * AM deer come from the food end. Other corridors are two-way.
+ * Every travel route the stand is scored for (all within range) is gated, not just
+ * the strongest: a weaker trail directly downwind still carries deer into your scent.
  */
 export function approachPaths(ctx: StandContext, window: PlanInputs['window']): SensitiveArea[] {
   const out: SensitiveArea[] = [];
-  const top = [...ctx.corridors].sort((a, b) => b.corridor.strength - a.corridor.strength).slice(0, 2);
-  for (const { corridor, along } of top) {
+  for (const { corridor, along } of ctx.corridors) {
     const L = polylineLength(corridor.points);
     let from: number;
     let to: number;
@@ -178,14 +203,17 @@ interface Evaluated {
   ctx: StandContext;
   passesAt: (fromDeg: number) => boolean;
   shotPlan: ShotPlan;
+  /** Yards to the travel the stand was set for when it lies beyond the hunter's range (no shot planned). */
+  travelBeyondRangeYds: number | null;
   eliminatedReasons: string[];
   windOnly: boolean;
 }
 
-function describeHit(origin: Vec, h: GateResult['hits'][number]): string {
+const plumeVerb = (h: PlumeHit) => (h.plume.kind === 'wind' ? 'Wind carries' : h.plume.kind === 'thermal_falling' ? 'Falling thermals carry' : h.plume.kind === 'thermal_rising' ? 'Rising thermals carry' : 'Swirling air carries');
+
+function describeHit(origin: Vec, h: PlumeHit): string {
   const where = h.area.shape.reduce((best, p) => (dist(origin, p) < dist(origin, best) ? p : best), h.area.shape[0]);
-  const plume = h.plume.kind === 'wind' ? 'Wind carries' : h.plume.kind === 'thermal_falling' ? 'Falling thermals carry' : h.plume.kind === 'thermal_rising' ? 'Rising thermals carry' : 'Swirling air carries';
-  return `${plume} scent onto ${h.area.label} (${Math.round(h.distanceM)} m ${compass16(bearingTo(origin, where))}).`;
+  return `${plumeVerb(h)} scent onto ${h.area.label} (${Math.round(h.distanceM)} m ${compass16(bearingTo(origin, where))}).`;
 }
 
 function evaluate(c: Candidate, req: PlanRequest, habitat: HabitatSummary, windState: WindState, baseAreas: SensitiveArea[]): Evaluated {
@@ -196,24 +224,39 @@ function evaluate(c: Candidate, req: PlanRequest, habitat: HabitatSummary, windS
   const areas = [...baseAreas, ...approachPaths(ctx, inputs.window)];
   const modelFor = (fromDeg: number, speed = windState.windSpeedMph) => scentModel({ ...windState, windFromDeg: fromDeg, windSpeedMph: speed }, slope, inputs.window);
   const model = modelFor(windState.windFromDeg);
-  const gate = evaluateGate(p, model, areas);
-  const passesAt = (fromDeg: number) => evaluateGate(p, modelFor(fromDeg), areas).passes;
+  const gate = gateAt(p, model, areas);
+  const passesAt = (fromDeg: number) => gateAt(p, modelFor(fromDeg), areas).passes;
 
-  const lanes = shotLanes(p, property.features, inputs.weapon.type, inputs.weapon.effectiveRangeYds);
+  const rangeYds = inputs.weapon.effectiveRangeYds;
+  const lanes = shotLanes(p, property.features, inputs.weapon.type, rangeYds);
   // The shot is at the travel the stand was set for; a trail directly under the stand isn't a shot plan.
-  const shotTarget = ctx.corridors.find((x) => x.corridor.id === c.corridorId && x.distanceM >= 5) ?? ctx.corridors.find((x) => x.distanceM >= 5) ?? ctx.corridors[0];
+  // Travel inside the hunter's range wins over travel just beyond it.
+  const shootable = (x: StandContext['corridors'][number]) => x.distanceM >= 5 && x.distanceM <= ydsToM(rangeYds);
+  const shotTarget =
+    ctx.corridors.find((x) => x.corridor.id === c.corridorId && shootable(x)) ??
+    ctx.corridors.find(shootable) ??
+    ctx.corridors.find((x) => x.corridor.id === c.corridorId && x.distanceM >= 5) ??
+    ctx.corridors.find((x) => x.distanceM >= 5) ??
+    ctx.corridors[0];
   let primaryBearing: number | null = null;
   let expected: number | null = null;
+  let travelBeyondRangeYds: number | null = null;
+  const notes = [`No shots beyond ${rangeYds} yds.`];
   if (shotTarget) {
     const proj = projectOntoPolyline(p, shotTarget.corridor.points);
     primaryBearing = bearingTo(p, proj.point);
-    expected = Math.max(5, Math.round(mToYds(proj.distance)));
+    const yds = Math.max(5, Math.round(mToYds(proj.distance)));
+    // The shot plan never states a shot beyond the hunter's effective range.
+    if (yds <= rangeYds) expected = yds;
+    else {
+      travelBeyondRangeYds = yds;
+      notes.push(`Deer travel passes ~${yds} yds ${compass16(primaryBearing)}, beyond your ${rangeYds} yd range. No shot unless he comes closer.`);
+    }
   }
-  const notes = [`No shots beyond ${inputs.weapon.effectiveRangeYds} yds.`];
   if (inputs.weapon.type === 'bow' || inputs.weapon.type === 'crossbow') notes.push('Broadside or quartering-away only. Let him clear the lane before drawing.');
   if (lanes.some((l) => l.status === 'no_shot')) notes.push('Red lanes point toward a road or house. Never shoot that way.');
   if (ctx.corridors.some((x) => x.distanceM < 5)) notes.push('A trail passes right under this stand. Expect close, steep shots and deer that may spot or wind you.');
-  const shotPlan: ShotPlan = { effectiveRangeYds: inputs.weapon.effectiveRangeYds, expectedShotYds: expected, primaryBearingDeg: primaryBearing, lanes, notes };
+  const shotPlan: ShotPlan = { effectiveRangeYds: rangeYds, expectedShotYds: expected, primaryBearingDeg: primaryBearing, lanes, notes };
 
   const reasons: string[] = [];
   if (!gate.passes) for (const h of gate.hits.filter((x) => x.hard)) reasons.push(describeHit(p, h));
@@ -222,7 +265,7 @@ function evaluate(c: Candidate, req: PlanRequest, habitat: HabitatSummary, windS
     reasons.push('The only shot toward deer travel points at a road or house.');
     windOnly = false;
   }
-  return { candidate: c, slope, model, areas, gate, ctx, passesAt, shotPlan, eliminatedReasons: reasons, windOnly };
+  return { candidate: c, slope, model, areas, gate, ctx, passesAt, shotPlan, travelBeyondRangeYds, eliminatedReasons: reasons, windOnly };
 }
 
 function confidenceFor(e: Evaluated, req: PlanRequest, sightingsNear: Sighting[], marginDeg: number, windState: WindState): Confidence {
@@ -279,7 +322,7 @@ export function corridorPhrase(c: Corridor): string {
 
 const PINCH_LEADS = new Set(['Saddle', 'Funnel', 'Creek crossing', 'Inside corner', 'Your stand']);
 
-function oneLineReason(e: Evaluated, windFromDeg: number): string {
+function oneLineReason(e: Evaluated, windFromDeg: number, assumedWind = false): string {
   const s = e.candidate.stand;
   const own = e.ctx.corridors.find((x) => x.corridor.id === e.candidate.corridorId);
   const c = (own ?? e.ctx.corridors[0])?.corridor;
@@ -287,30 +330,59 @@ function oneLineReason(e: Evaluated, windFromDeg: number): string {
   const phrase = c ? corridorPhrase(c) : '';
   const what = !c ? `${s.name}, with no mapped travel in range` : PINCH_LEADS.has(lead) ? `${lead} ${phrase}` : phrase[0].toUpperCase() + phrase.slice(1);
   const bed = e.ctx.nearestBedding ? `, ${Math.round(e.ctx.nearestBedding.distanceM)} m off ${e.ctx.nearestBedding.area.kind === 'unknown' ? '' : e.ctx.nearestBedding.area.kind + ' '}bedding` : '';
+  if (assumedWind) return `If the wind turns ${compass16(windFromDeg)}: ${what}${bed}. Scent would carry ${compass16(downwindBearing(windFromDeg))}, clear of the approach and bedding.`;
   return `${what}${bed}. ${compass16(windFromDeg)} wind carries scent ${compass16(downwindBearing(windFromDeg))}, clear of the approach and bedding.`;
+}
+
+/** A forecast hour that fails the gate in the SAME direction the stand works for: light air (thermals, swirl) or gusts. */
+interface LightAirFailure {
+  at: string;
+  speedMph: number;
+  hit: PlumeHit;
 }
 
 interface Scored {
   e: Evaluated;
+  /** The wind this stand was scored for (today's, or the assumed wind of a wind-shift backup). */
+  ws: WindState;
   routes: RoutePair;
   components: ScoreComponent[];
   total: number;
   margin: number;
   sightingsNear: Sighting[];
+  /** Forecast hours whose wind DIRECTION puts scent on deer here. */
   shiftFailures: Array<{ at: string; fromDeg: number }>;
+  lightAirFailures: LightAirFailure[];
 }
 
-function risksFor(s: Scored, req: PlanRequest, setbackM: number, windState: WindState): Risk[] {
+/** No-go for reasons of the stand itself (not the weather): never ranked above a huntable stand. */
+const standNoGo = (s: Scored) => s.routes.unreachable || s.shiftFailures.length > 0;
+const rankOrder = (a: Scored, b: Scored) => Number(standNoGo(a)) - Number(standNoGo(b)) || b.total - a.total;
+
+function lightAirText(f: LightAirFailure): string {
+  const verb = plumeVerb(f.hit).toLowerCase();
+  return f.speedMph < LIGHT_WIND_MPH
+    ? `Light air (${Math.round(f.speedMph)} mph) during part of the sit: ${verb} scent onto ${f.hit.area.label}.`
+    : `Gusts during part of the sit widen the scent cone onto ${f.hit.area.label}.`;
+}
+
+function risksFor(s: Scored, req: PlanRequest, setbackM: number): Risk[] {
   const risks: Risk[] = [];
+  const windState = s.ws;
   const p = s.e.candidate.stand.position;
   const { inputs } = req;
+  if (s.routes.unreachable) risks.push({ severity: 3, text: UNREACHABLE_RISK });
   if (s.shiftFailures.length) {
     risks.push({ severity: 3, text: `Forecast swings to ${compass16(s.shiftFailures[0].fromDeg)} during the sit, which puts scent on deer.` });
+  }
+  if (s.lightAirFailures.length) {
+    const f = s.lightAirFailures[0];
+    risks.push({ severity: f.hit.area.kind === 'bedding' ? 3 : 2, text: lightAirText(f) });
   }
   if (s.margin < 25) {
     for (const side of [1, -1]) {
       const test = normDeg(windState.windFromDeg + side * (s.margin + 5));
-      const g = evaluateGate(p, scentModel({ ...windState, windFromDeg: test }, s.e.slope, inputs.window), s.e.areas);
+      const g = gateAt(p, scentModel({ ...windState, windFromDeg: test }, s.e.slope, inputs.window), s.e.areas);
       const hit = g.hits.find((h) => h.hard);
       if (hit) {
         risks.push({ severity: 3, text: `Thin wind margin (~${Math.round(s.margin)}°). A shift toward ${compass16(test)} puts scent on ${hit.area.label}.` });
@@ -327,6 +399,8 @@ function risksFor(s: Scored, req: PlanRequest, setbackM: number, windState: Wind
     if (bad) risks.push({ severity: 3, text: `${r.kind === 'entry' ? 'Entry' : 'Exit'}: ${bad.reason}` });
     else if (warn) risks.push({ severity: 2, text: `${r.kind === 'entry' ? 'Entry' : 'Exit'}: ${warn.reason}` });
   }
+  const travelYds = s.e.travelBeyondRangeYds;
+  if (travelYds !== null) risks.push({ severity: 3, text: `Deer travel is ~${travelYds} yds out, beyond your ${inputs.weapon.effectiveRangeYds} yd range. No ethical shot unless he comes closer.` });
   for (const h of s.e.gate.hits.filter((x) => !x.hard)) risks.push({ severity: 2, text: `Scent may drift toward ${h.area.label} (${Math.round(h.distanceM)} m).` });
   if (s.e.model.thermalsApplied) {
     const falling = s.e.model.plumes.find((x) => x.kind === 'thermal_falling');
@@ -334,7 +408,7 @@ function risksFor(s: Scored, req: PlanRequest, setbackM: number, windState: Wind
   }
   const pressure = s.components.find((c) => c.key === 'pressureHistory');
   if (pressure && pressure.value <= 2.5) risks.push({ severity: 2, text: pressure.reasons[0] });
-  if (!s.routes.entry) risks.push({ severity: 2, text: 'No access point mapped, so the entry route is unverified.' });
+  if (s.routes.noAccess) risks.push({ severity: 2, text: 'No access point mapped, so the entry route is unverified.' });
   const shotYds = s.e.shotPlan.expectedShotYds;
   if (shotYds !== null && shotYds > inputs.weapon.effectiveRangeYds * 0.85) risks.push({ severity: 1, text: `Expected shot (~${shotYds} yds) is near your max range.` });
   risks.push({ severity: 1, text: `Mature bucks scent-check downwind. Watch the ${compass16(downwindBearing(windState.windFromDeg))} side; that's where he'll try to wind you.` });
@@ -346,20 +420,26 @@ function risksFor(s: Scored, req: PlanRequest, setbackM: number, windState: Wind
     .slice(0, 2);
 }
 
-function decisionFor(s: Scored, weather: Decision, windState: WindState): Decision {
+function decisionFor(s: Scored, weather: Decision, req: PlanRequest): Decision {
   const reasons: string[] = [];
   let status: Decision['status'] = 'go';
-  if (weather.status === 'no_go') return { status: 'no_go', reasons: weather.reasons };
+  // A fresh array: callers may prepend stand-specific notes (the backup note) to it.
+  if (weather.status === 'no_go') return { status: 'no_go', reasons: [...weather.reasons] };
   const raise = (st: Decision['status'], r: string) => {
     reasons.push(r);
     if (st === 'no_go' || (st === 'caution' && status === 'go')) status = st;
   };
+  if (s.routes.unreachable) raise('no_go', 'No legal walking route in from your access points. Mark another access point or skip this stand.');
   if (s.shiftFailures.length) raise('no_go', `Forecast wind shifts to ${compass16(s.shiftFailures[0].fromDeg)} mid-sit, a direction this stand can't handle.`);
+  if (s.lightAirFailures.length) raise('caution', `${lightAirText(s.lightAirFailures[0])} Check the air at the base of the tree.`);
   if (s.margin < 15) raise('caution', 'The wind barely works. Check it at the truck and again at the base of the tree.');
   if (s.routes.entry?.worstStatus === 'avoid') raise('caution', 'Entry route crosses a red zone. Only go if you can take the alternate edge.');
+  const exitBad = s.routes.exit?.segments.find((x) => x.status === 'avoid');
+  if (exitBad) raise('caution', `Exit crosses a red zone (${lower(exitBad.reason).replace(/\.$/, '')}). Wait for deer to clear out, or take the alternate edge.`);
+  if (s.e.travelBeyondRangeYds !== null) raise('caution', `Deer travel here is ~${s.e.travelBeyondRangeYds} yds out, beyond your ${req.inputs.weapon.effectiveRangeYds} yd range.`);
   if (s.total < 45) raise('caution', 'Low odds today. Consider saving this stand for a better day.');
   if (weather.status === 'caution') for (const r of weather.reasons) raise('caution', r);
-  if (windState.windSpeedMph < 2) raise('caution', 'Near-calm air. Scent will pool, so expect the unexpected.');
+  if (s.ws.windSpeedMph < 2) raise('caution', 'Near-calm air. Scent will pool, so expect the unexpected.');
   if (status === 'go') reasons.push('Wind, access and timing all line up.');
   return { status, reasons };
 }
@@ -376,12 +456,16 @@ export function planHunt(req: PlanRequest): Plan {
   const sun = sunTimes(inputs.date, inputs.location.lat, inputs.location.lon);
   const legal = legalHours(sun);
   const sit = sitWindow(inputs, phase.phase, sun);
-  const weatherDecision = assessWeather(w);
 
+  // Forecast hours that overlap the sit (an hour starting just before the sit still covers its first minutes).
+  const sitStartMs = Date.parse(sit.start);
+  const sitEndMs = Date.parse(sit.end);
   const hourlyInWindow = (w.hourly ?? []).filter((h) => {
     const t = Date.parse(h.at);
-    return t >= Date.parse(sit.start) - 3_600_000 && t <= Date.parse(sit.end);
+    return t + 3_600_000 > sitStartMs && t < sitEndMs;
   });
+  // Weather gates use the worst hour of the sit, not just the snapshot hour.
+  const weatherDecision = assessWeather(w, hourlyInWindow);
   const windState: WindState = {
     windFromDeg: w.windFromDeg,
     windSpeedMph: w.windSpeedMph,
@@ -402,24 +486,37 @@ export function planHunt(req: PlanRequest): Plan {
   const survivors = evaluated.filter((e) => e.eliminatedReasons.length === 0);
   const eliminated: EliminatedStand[] = evaluated.filter((e) => e.eliminatedReasons.length > 0).map((e) => ({ stand: e.candidate.stand, reasons: e.eliminatedReasons }));
 
-  const routePlanner = createRoutePlanner(
-    { property, habitat, setbackM, windFromDeg: w.windFromDeg, windSpeedMph: w.windSpeedMph, window: inputs.window },
-    candidates.map((c) => c.stand.position),
-  );
+  const plannerFor = (windFromDeg: number, routeHabitat: HabitatSummary) =>
+    createRoutePlanner(
+      { property, habitat: routeHabitat, setbackM, windFromDeg, windSpeedMph: w.windSpeedMph, window: inputs.window },
+      candidates.map((c) => c.stand.position),
+    );
+  const routePlanner = plannerFor(w.windFromDeg, habitat);
   const maxCorridorStrength = habitat.corridors.reduce((m, c) => Math.max(m, c.strength), 0);
-  const midSit = new Date((Date.parse(sit.start) + Date.parse(sit.end)) / 2);
+  const midSit = new Date((sitStartMs + sitEndMs) / 2);
   const modifiers: Modifier[] = [moonModifier(midSit, inputs.window), pressureModifier(w)];
   const nowMs = now.getTime();
 
-  const scoreOne = (e: Evaluated, ws: WindState, weather: WeatherSnapshot): Scored => {
+  const scoreOne = (e: Evaluated, ws: WindState, weather: WeatherSnapshot, opts: { hourly?: HourlyWind[]; routePlanner?: RoutePlanner; routes?: RoutePair } = {}): Scored => {
     const p = e.candidate.stand.position;
     const margin = windMargin(e.passesAt, ws.windFromDeg);
-    const routes = routePlanner.plan(p);
+    const routes = opts.routes ?? (opts.routePlanner ?? routePlanner).plan(p);
     const sightingsNear = relevantSightings(p, sightings, nowMs);
+    // Re-run the gate for each forecast hour. A failure in a direction the stand handles
+    // (per its dial) is light air or gusts, not a wind shift, and is reported as such.
+    const shiftFailures: Scored['shiftFailures'] = [];
+    const lightAirFailures: LightAirFailure[] = [];
+    for (const h of opts.hourly ?? hourlyInWindow) {
+      const g = gateAt(p, scentModel({ windFromDeg: h.windFromDeg, windSpeedMph: h.windSpeedMph, windGustMph: Math.max(h.windGustMph ?? h.windSpeedMph, h.windSpeedMph) }, e.slope, inputs.window), e.areas);
+      if (g.passes) continue;
+      if (!e.passesAt(h.windFromDeg)) shiftFailures.push({ at: h.at, fromDeg: h.windFromDeg });
+      else lightAirFailures.push({ at: h.at, speedMph: h.windSpeedMph, hit: g.hits.find((x) => x.hard) ?? g.hits[0] });
+    }
     const softHits = e.gate.hits.filter((h) => !h.hard).map((h) => `Scent may drift toward ${h.area.label} ${Math.round(h.distanceM)} m out.`);
+    if (lightAirFailures.length) softHits.push(lightAirText(lightAirFailures[0]));
     const components = [
       scoreWindFit(margin, Math.max(0, ws.windGustMph - ws.windSpeedMph), ws.windSpeedMph < LIGHT_WIND_MPH, softHits, e.model.thermalsApplied),
-      scoreAccess(routes.entry, routes.exit, routes.noAccess),
+      scoreAccess(routes.entry, routes.exit, routes.noAccess, routes.unreachable),
       scoreMovement(e.ctx, maxCorridorStrength, sightingsNear, phase.phase, inputs.window),
       scoreBeddingDistance(e.ctx, setbackM),
       scoreShot(e.ctx, inputs.weapon.effectiveRangeYds, e.shotPlan.primaryBearingDeg === null || laneFor(e.shotPlan.lanes, e.shotPlan.primaryBearingDeg).status === 'open'),
@@ -428,81 +525,100 @@ export function planHunt(req: PlanRequest): Plan {
       scoreWeatherTime(weather, inputs.date, inputs.window, phase.phase, e.ctx, modifiers, sightingsNear.length > 0),
     ];
     if (e.candidate.stand.origin === 'existing') components[0].reasons.push('Your existing stand. Scored with the same rules.');
-    const shiftFailures = hourlyInWindow
-      .filter((h) => {
-        const g = evaluateGate(p, scentModel({ windFromDeg: h.windFromDeg, windSpeedMph: h.windSpeedMph, windGustMph: h.windGustMph ?? h.windSpeedMph }, e.slope, inputs.window), e.areas);
-        return !g.passes;
-      })
-      .map((h) => ({ at: h.at, fromDeg: h.windFromDeg }));
-    return { e, routes, components, total: totalScore(components).total, margin, sightingsNear, shiftFailures };
+    return { e, ws, routes, components, total: totalScore(components).total, margin, sightingsNear, shiftFailures, lightAirFailures };
   };
 
-  const scored = survivors.map((e) => scoreOne(e, windState, w)).sort((a, b) => b.total - a.total);
+  // A stand that is no-go on its own (forecast shift, no legal route) never ranks above a huntable one.
+  const scored = survivors.map((e) => scoreOne(e, windState, w)).sort(rankOrder);
+  const huntable = scored.filter((s) => !standNoGo(s));
 
-  const build = (s: Scored, rank: number, isBackup: boolean, ws: WindState, backupNote?: string): StandRecommendation => ({
+  const build = (s: Scored, rank: number, isBackup: boolean, backupNote?: string, assumedWind = false): StandRecommendation => ({
     stand: s.e.candidate.stand,
     rank,
     isBackup,
     backupNote,
     score: totalScore(s.components),
-    reason: oneLineReason(s.e, ws.windFromDeg),
+    reason: oneLineReason(s.e, s.ws.windFromDeg, assumedWind),
     sitWindow: sit,
-    windDial: windDial(s.e.passesAt, ws.windFromDeg),
+    windDial: windDial(s.e.passesAt, s.ws.windFromDeg),
     entryRoute: s.routes.entry,
     exitRoute: s.routes.exit,
     shotPlan: s.e.shotPlan,
-    risks: risksFor(s, req, setbackM, ws),
-    confidence: confidenceFor(s.e, req, s.sightingsNear, s.margin, ws),
-    decision: decisionFor(s, weatherDecision, ws),
+    risks: risksFor(s, req, setbackM),
+    confidence: confidenceFor(s.e, req, s.sightingsNear, s.margin, s.ws),
+    decision: decisionFor(s, weatherDecision, req),
     safetyReminders: [HARNESS_REMINDER, ...weaponSafetyReminders(inputs.weapon.type)],
-    plumes: scentModel(ws, s.e.slope, inputs.window).plumes.map(({ kind, bearingDeg, halfAngleDeg, lengthM }) => ({ kind, bearingDeg, halfAngleDeg, lengthM })),
+    plumes: scentModel(s.ws, s.e.slope, inputs.window).plumes.map(({ kind, bearingDeg, halfAngleDeg, lengthM }) => ({ kind, bearingDeg, halfAngleDeg, lengthM })),
+    ...(assumedWind ? { assumedWindFromDeg: s.ws.windFromDeg } : {}),
   });
 
   // Top 3, kept at least 100 m apart so the hunter gets real alternatives, not one spot three times.
+  // Huntable stands first (distinct setups, then alternate trees), then no-go stands only to fill.
   const picked: Scored[] = [];
-  for (const s of scored) {
-    if (picked.length === 3) break;
-    if (picked.every((p) => dist(p.e.candidate.stand.position, s.e.candidate.stand.position) >= MIN_PICK_SPACING_M)) picked.push(s);
+  const spaced = (s: Scored, among: Scored[]) => among.every((p) => dist(p.e.candidate.stand.position, s.e.candidate.stand.position) >= MIN_PICK_SPACING_M);
+  for (const pool of [huntable, scored.filter(standNoGo)]) {
+    for (const s of pool) if (picked.length < 3 && spaced(s, picked)) picked.push(s);
+    for (const s of pool) if (picked.length < 3 && !picked.includes(s)) picked.push(s);
   }
-  const spacedCount = picked.length;
-  for (const s of scored) {
-    if (picked.length === 3) break;
-    if (!picked.includes(s)) picked.push(s);
-  }
+  // Ranks follow the same order as everywhere else: huntable before no-go, then score.
+  picked.sort(rankOrder);
+  const spacedCount = picked.filter((s, i) => spaced(s, picked.slice(0, i))).length;
   const closeAlternates = picked.length > spacedCount;
-  const recommendations = picked.map((s, i) => build(s, i + 1, false, windState));
+  const recommendations = picked.map((s, i) => build(s, i + 1, false));
 
-  // Backup: a stand that tolerates winds the #1 pick can't.
+  // Backup: a stand you can hunt TODAY that tolerates winds the #1 pick can't.
   let backup: StandRecommendation | null = null;
   if (recommendations.length) {
     const topDial = recommendations[0].windDial;
     const differs = (dial: WindDial) => dial.sectors.filter((sec, i) => sec.status === 'good' && topDial.sectors[i].status === 'bad').length;
-    const pool = scored.filter((s) => !picked.includes(s)).map((s) => ({ s, diff: differs(windDial(s.e.passesAt, windState.windFromDeg)) }));
+    const pool = huntable.filter((s) => !picked.includes(s)).map((s) => ({ s, diff: differs(windDial(s.e.passesAt, windState.windFromDeg)) }));
     // A stand you can hunt TODAY that also covers winds the #1 can't beats a hypothetical one.
     const pick = pool.find((x) => x.diff >= MIN_BACKUP_EXTRA_SECTORS);
     if (pick) {
-      backup = build(pick.s, 4, true, windState, `Handles winds the top stand can't. Switch here if the wind turns.`);
+      backup = build(pick.s, 4, true, `Handles winds the top stand can't. Switch here if the wind turns.`);
     }
   }
   if (!backup) {
-    // Fall back to a stand eliminated by today's wind but good for the likely shift.
-    const shiftDirs: number[] = [];
-    const forecastShift = hourlyInWindow.find((h) => Math.abs(normDeg(h.windFromDeg - w.windFromDeg + 180) - 180) >= 30);
-    if (forecastShift) shiftDirs.push(forecastShift.windFromDeg);
-    shiftDirs.push(normDeg(w.windFromDeg + 45), normDeg(w.windFromDeg - 45), normDeg(w.windFromDeg + 90), normDeg(w.windFromDeg - 90));
-    let best: { s: Scored; dir: number } | null = null;
-    for (const e of evaluated.filter((x) => x.windOnly)) {
-      for (const dir of shiftDirs) {
-        if (!e.passesAt(dir)) continue;
-        const ws = { ...windState, windFromDeg: dir };
-        const s = scoreOne(e, ws, { ...w, windFromDeg: dir });
-        if (!best || s.total > best.s.total) best = { s, dir };
-        break;
-      }
+    // Fall back to a stand eliminated by today's wind but good for a shift: the forecast
+    // shift first, a hypothetical ±45°/±90° swing only when nothing works for the forecast.
+    // It is evaluated end to end for that wind (gate, dial, plumes, routes), and only the
+    // forecast hours after the shift count against it.
+    const shiftIdx = hourlyInWindow.findIndex((h) => angleDiff(h.windFromDeg, w.windFromDeg) >= FORECAST_SHIFT_DEG);
+    // Cruise lines sit downwind of doe bedding for TODAY's wind; under another wind they move.
+    const shiftHabitat: HabitatSummary = { ...habitat, corridors: habitat.corridors.filter((c) => c.kind !== 'cruise') };
+    const cruiseIds = new Set(habitat.corridors.filter((c) => c.kind === 'cruise').map((c) => c.id));
+    const pool = evaluated.filter((x) => x.windOnly && !(x.candidate.corridorId && cruiseIds.has(x.candidate.corridorId)));
+    // Stage 1 (cheap): find each stand's wind and score it without routes.
+    // Stage 2: route only the few best for their assumed wind, then pick.
+    const unrouted: RoutePair = { entry: null, exit: null, noAccess: true, unreachable: false };
+    const options: Array<{ e: Evaluated; ws: WindState; hours: HourlyWind[]; rough: Scored }> = [];
+    const tryWind = (e: Evaluated, dir: number, hours: HourlyWind[]): boolean => {
+      const ws: WindState = { ...windState, windFromDeg: dir, directionSpreadDeg: hours.length ? directionSpread(dir, hours.map((h) => h.windFromDeg)) : windState.directionSpreadDeg };
+      const e2 = evaluate(e.candidate, req, shiftHabitat, ws, baseAreas);
+      if (e2.eliminatedReasons.length) return false;
+      options.push({ e: e2, ws, hours, rough: scoreOne(e2, ws, { ...w, windFromDeg: dir }, { hourly: hours, routes: unrouted }) });
+      return true;
+    };
+    if (shiftIdx >= 0) {
+      const after = hourlyInWindow.slice(shiftIdx);
+      for (const e of pool) tryWind(e, after[0].windFromDeg, after);
     }
+    if (!options.length) {
+      const swings = [45, -45, 90, -90].map((d) => normDeg(w.windFromDeg + d));
+      for (const e of pool) for (const dir of swings) if (tryWind(e, dir, [])) break;
+    }
+    const planners = new Map<number, RoutePlanner>();
+    const routerFor = (dir: number) => {
+      if (!planners.has(dir)) planners.set(dir, plannerFor(dir, shiftHabitat));
+      return planners.get(dir) as RoutePlanner;
+    };
+    const finalists = options.sort((a, b) => rankOrder(a.rough, b.rough)).slice(0, 3);
+    const best = finalists
+      .map((o) => scoreOne(o.e, o.ws, { ...w, windFromDeg: o.ws.windFromDeg }, { hourly: o.hours, routePlanner: routerFor(o.ws.windFromDeg) }))
+      .sort(rankOrder)[0];
     if (best) {
-      const note = `Only if the wind shifts to ${compass16(best.dir)}. Today's wind blows scent onto deer here.`;
-      backup = build(best.s, 4, true, { ...windState, windFromDeg: best.dir }, note);
+      const note = `Only if the wind shifts to ${compass16(best.ws.windFromDeg)}. Today's wind blows scent onto deer here.`;
+      backup = build(best, 4, true, note, true);
       // Scored as if the wind had shifted, so it is never a plain GO for today's wind.
       if (backup.decision.status === 'go') backup.decision = { status: 'caution', reasons: [note] };
       else backup.decision.reasons.unshift(note);
@@ -513,7 +629,7 @@ export function planHunt(req: PlanRequest): Plan {
   const shown = new Set([...recommendations, ...(backup ? [backup] : [])].map((r) => r.stand.id));
   const yourStands = scored
     .filter((s) => s.e.candidate.stand.origin === 'existing' && !shown.has(s.e.candidate.stand.id))
-    .map((s) => build(s, scored.indexOf(s) + 1, false, windState));
+    .map((s) => build(s, scored.indexOf(s) + 1, false));
 
   const warnings: PlanWarning[] = [];
   if (!phase.regionTuned || phase.source === 'calendar') warnings.push({ level: 'info', text: phase.note || PHASE_TACTICS[phase.phase] });
@@ -521,6 +637,7 @@ export function planHunt(req: PlanRequest): Plan {
   if (!property.features.some((f) => f.status === 'active' && f.type === 'access_point')) warnings.push({ level: 'caution', text: 'No access point marked. Routes start from the nearest road or property line.' });
   if (habitat.bedding.length === 0) warnings.push({ level: 'caution', text: 'No bedding identified. Mark known bedding for much better stand placement.' });
   if (scored.length === 0) warnings.push({ level: 'no_go', text: 'No stand passes today’s wind. Best move may be to stay out and save the property.' });
+  else if (huntable.length === 0) warnings.push({ level: 'no_go', text: 'Every stand that passes today’s wind is a no-go for this sit (forecast wind shift or no legal route in). Best move may be to stay out.' });
   else if (scored.length < 3) warnings.push({ level: 'caution', text: `Only ${scored.length} stand${scored.length === 1 ? '' : 's'} pass the wind gate today.` });
   if (closeAlternates) warnings.push({ level: 'info', text: `Today's wind leaves only ${spacedCount} distinct setup${spacedCount === 1 ? '' : 's'}; the others are alternate trees near them.` });
   if (w.windSpeedMph < LIGHT_WIND_MPH) warnings.push({ level: 'caution', text: 'Light wind. Thermals control your scent, so plume arrows show both directions.' });

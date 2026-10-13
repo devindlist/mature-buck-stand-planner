@@ -1,14 +1,19 @@
 import React, { useState } from 'react';
 import { Alert, Pressable, ScrollView, Text, View } from 'react-native';
 import { router } from 'expo-router';
-import { DISCLAIMER } from '@msp/engine';
-import { useAppStore, type Settings } from '../src/state/store';
+import { DISCLAIMER, type WeaponType } from '@msp/engine';
+import { DEFAULT_RANGE_YDS, MAX_RANGE_YDS, useAppStore, type Settings } from '../src/state/store';
 import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Body, Disclaimer, Field, Label, Screen, Segmented, Stepper } from '../src/components/ui';
 import { setSetting } from '../src/db/repos';
-import { wipeAllData } from '../src/db/database';
+import { deleteAllData } from '../src/services/dataReset';
+import { checkInBlockedReason, ensureNotificationPermission } from '../src/services/checkin';
+import { androidApiLevel, isAndroid, openAppSettings } from '../src/services/platform';
 import { downloadOfflinePack } from '../src/services/offlineMaps';
 import { font, RADIUS, SPACE, TOUCH } from '../src/theme/theme';
+
+const WEAPONS: readonly WeaponType[] = ['bow', 'crossbow', 'muzzleloader', 'shotgun', 'rifle'];
+const WEAPON_LABELS: Partial<Record<WeaponType, string>> = { bow: 'Bow', crossbow: 'Xbow', muzzleloader: 'Muzz', shotgun: 'Shotgun', rifle: 'Rifle' };
 
 export default function SettingsScreen() {
   const t = useTheme();
@@ -18,6 +23,8 @@ export default function SettingsScreen() {
   const set = useAppStore((s) => s.set);
   const property = useAppStore((s) => s.activeProperty());
   const [pack, setPack] = useState<string | null>(null);
+  const [notif, setNotif] = useState<string | null>(null);
+  const [wiping, setWiping] = useState(false);
 
   const update = (patch: Partial<Settings>) => {
     setSettings(patch);
@@ -35,6 +42,25 @@ export default function SettingsScreen() {
       </View>
     </Pressable>
   );
+
+  const checkReminders = async () => {
+    const granted = await ensureNotificationPermission().catch(() => false);
+    const blocked = granted ? await checkInBlockedReason().catch(() => undefined) : undefined;
+    setNotif(granted && !blocked ? 'Check-in reminders can fire ✓' : (blocked ?? 'Notifications are off. Open Settings to allow them.'));
+  };
+
+  const deleteEverything = async () => {
+    setWiping(true);
+    try {
+      const failed = await deleteAllData();
+      if (failed.length) Alert.alert('Some data could not be deleted', `Could not remove: ${failed.join(', ')}. Try again, or uninstall the app to remove everything.`);
+      router.replace('/');
+    } finally {
+      setWiping(false);
+    }
+  };
+
+  const rangeMismatch = settings.defaultRangeYds > MAX_RANGE_YDS[settings.defaultWeapon];
 
   const downloadMaps = async () => {
     if (!property) return;
@@ -64,14 +90,39 @@ export default function SettingsScreen() {
         <Field label="Emergency contact name" value={settings.emergencyContact.name} onChangeText={(v) => update({ emergencyContact: { ...settings.emergencyContact, name: v } })} />
         <Field label="Emergency contact phone" value={settings.emergencyContact.phone} onChangeText={(v) => update({ emergencyContact: { ...settings.emergencyContact, phone: v } })} keyboardType="phone-pad" />
         <Stepper label="Default check-in after" value={settings.checkInMinutes} onChange={(v) => update({ checkInMinutes: v })} step={30} min={30} max={720} unit="min" />
+        <BigButton label="Check reminder permission" kind="secondary" onPress={() => void checkReminders()} sublabel="Check-in reminders need notifications on" />
+        {notif ? <Text style={{ color: t.textDim }}>{notif}</Text> : null}
+        {isAndroid && androidApiLevel >= 31 ? (
+          <>
+            <Body dim>Android can hold back reminders by up to an hour unless "Alarms & reminders" is allowed for Stand Planner (App info › Alarms & reminders).</Body>
+            <BigButton label="Open app settings" kind="ghost" onPress={() => void openAppSettings()} />
+          </>
+        ) : null}
 
         <Label>HUNTING</Label>
-        <Stepper label="Default effective range" value={settings.defaultRangeYds} onChange={(v) => update({ defaultRangeYds: v })} step={5} min={10} max={400} unit="yds" />
+        <Segmented options={WEAPONS} value={settings.defaultWeapon} onChange={(w) => update({ defaultWeapon: w, defaultRangeYds: DEFAULT_RANGE_YDS[w] })} labels={WEAPON_LABELS} />
+        <Stepper
+          label={`Default effective range (${WEAPON_LABELS[settings.defaultWeapon] ?? settings.defaultWeapon})`}
+          value={settings.defaultRangeYds}
+          onChange={(v) => update({ defaultRangeYds: v })}
+          step={5}
+          min={10}
+          max={MAX_RANGE_YDS[settings.defaultWeapon]}
+          unit="yds"
+        />
+        {rangeMismatch ? (
+          <Text style={{ color: t.status.caution, fontSize: font.sm }}>
+            ! {settings.defaultRangeYds} yds is beyond {WEAPON_LABELS[settings.defaultWeapon] ?? settings.defaultWeapon} range, so plans start at {DEFAULT_RANGE_YDS[settings.defaultWeapon]} yds. Pick your weapon above.
+          </Text>
+        ) : null}
 
         <Label>DISPLAY & PRIVACY</Label>
         {toggle('Red-light theme', redLight, () => set({ redLight: !redLight }), 'Hunt mode turns this on automatically')}
-        {toggle('Haptics', settings.haptics, () => update({ haptics: !settings.haptics }), 'Off by default. The app never plays sounds.')}
-        {toggle('Allow sharing plans', settings.shareOptIn, () => update({ shareOptIn: !settings.shareOptIn }), 'Off by default. Nothing leaves your phone unless this is on AND you tap Share.')}
+        {toggle('Haptics', settings.haptics, () => update({ haptics: !settings.haptics }), 'Off by default. The app plays no sounds; on iPhone, check-in reminders use the system alert (ring switch on silent = vibrate only).')}
+        {toggle('Allow sharing plans', settings.shareOptIn, () => update({ shareOptIn: !settings.shareOptIn }), 'Off by default. Your plans, hunts and sightings never leave your phone unless this is on AND you tap Share.')}
+        <Body dim>
+          Lookups use your property's coordinates: the forecast comes from the National Weather Service, and terrain and land cover from USGS, MRLC and USDA cropland data (hosted by George Mason University). Those public services see the coordinates they're asked about, not your plans. In Vision proxy mode the map photo goes to your proxy, which sends it to Claude.
+        </Body>
 
         <Label>OFFLINE MAPS</Label>
         <Body dim>Download USGS imagery and topo for the active property (zoom 12–16, public domain) so the basemap works with no signal.</Body>
@@ -79,23 +130,22 @@ export default function SettingsScreen() {
         {pack ? <Text style={{ color: t.textDim }}>{pack}</Text> : null}
 
         <Label>DATA</Label>
-        <Body dim>All data is stored on this phone in an encrypted database. The key lives in the secure enclave/keystore.</Body>
+        <Body dim>
+          Properties, plans, hunts, sightings and settings are stored on this phone in an encrypted database; its key stays in this phone's Keychain/Keystore and never moves to another phone. Map photos are kept as image files in the app's private storage (not encrypted, and included in your phone's iCloud backup on iPhone).
+        </Body>
         <BigButton
           label="Delete all data"
           kind="danger"
+          loading={wiping}
           onPress={() =>
-            Alert.alert('Delete everything?', 'Properties, plans, hunts and sightings will be permanently erased from this phone.', [
-              { text: 'Cancel', style: 'cancel' },
-              {
-                text: 'Delete',
-                style: 'destructive',
-                onPress: async () => {
-                  await wipeAllData();
-                  set({ properties: [], activePropertyId: null, plan: null, hunt: null });
-                  router.replace('/');
-                },
-              },
-            ])
+            Alert.alert(
+              'Delete everything?',
+              'Properties, plans, hunts, sightings, map photos, offline maps, settings (including your emergency contact) and any pending check-in reminders will be permanently erased from this phone.',
+              [
+                { text: 'Cancel', style: 'cancel' },
+                { text: 'Delete', style: 'destructive', onPress: () => void deleteEverything() },
+              ],
+            )
           }
         />
         <View style={{ marginTop: SPACE, padding: 12, borderRadius: RADIUS, borderWidth: 1, borderColor: t.border }}>

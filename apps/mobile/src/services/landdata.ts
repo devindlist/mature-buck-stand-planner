@@ -29,6 +29,30 @@ export function createLandDataProvider(): LandDataProvider {
   };
 }
 
+/** Share of grid points that must have a real 3DEP elevation before thermals use the grid. */
+const MIN_GRID_COVERAGE = 0.8;
+
+/** Cached grid as stored. JSON has no NaN: a failed sample comes back from the cache as null. */
+interface ElevationGridJson {
+  origin: { x: number; y: number };
+  cellM: number;
+  cols: number;
+  rows: number;
+  values: Array<number | null>;
+}
+
+/** Build the terrain model, or undefined if the grid is malformed or has too many holes. */
+function toTerrain(grid: ElevationGridJson | undefined): GridTerrain | undefined {
+  if (!grid || !Array.isArray(grid.values)) return undefined;
+  try {
+    // GridTerrain reads NaN and null alike as "no data", never as 0 m (which would fake a cliff).
+    const terrain = new GridTerrain(grid.origin, grid.cellM, grid.cols, grid.rows, grid.values);
+    return terrain.coverage() >= MIN_GRID_COVERAGE ? terrain : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** 3DEP elevation grid over the property for thermals (cached; ~400 points at 60 m). */
 export async function loadTerrain(property: Property): Promise<TerrainModel | undefined> {
   const cal = property.calibration;
@@ -40,15 +64,16 @@ export async function loadTerrain(property: Property): Promise<TerrainModel | un
   const half = Math.min(1500, Math.max(b.maxX - b.minX, b.maxY - b.minY) / 2);
   const cell = Math.max(40, (2 * half) / 20);
   const key = `grid:${property.id}:${Math.round(center.x)}:${Math.round(center.y)}:${Math.round(half)}`;
-  let grid = await cacheGet<{ origin: { x: number; y: number }; cellM: number; cols: number; rows: number; values: number[] }>(key, YEAR_MS);
-  if (!grid) {
-    try {
-      grid = await sampleElevationGrid(createLandDataProvider(), cal.originGeo, center, half, cell);
-      if (grid.values.filter((v) => Number.isFinite(v)).length < grid.values.length * 0.8) return undefined;
-      await cacheSet(key, grid);
-    } catch {
-      return undefined;
-    }
+  // A cached grid is validated exactly like a fresh one before it is trusted offline.
+  const fromCache = toTerrain(await cacheGet<ElevationGridJson>(key, YEAR_MS).catch(() => undefined));
+  if (fromCache) return fromCache;
+  try {
+    const grid = await sampleElevationGrid(createLandDataProvider(), cal.originGeo, center, half, cell);
+    const terrain = toTerrain(grid);
+    if (!terrain) return undefined;
+    await cacheSet(key, grid).catch(() => undefined);
+    return terrain;
+  } catch {
+    return undefined;
   }
-  return new GridTerrain(grid.origin, grid.cellM, grid.cols, grid.rows, grid.values);
 }

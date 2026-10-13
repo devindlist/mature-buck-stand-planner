@@ -54,3 +54,16 @@ test('normal temps are colder in November than September', () => {
   assert.ok(normalTempF('2026-11-15', 'PM') < normalTempF('2026-09-15', 'PM'));
   assert.ok(normalTempF('2026-11-15', 'AM') < normalTempF('2026-11-15', 'PM'));
 });
+
+test('normal temps are anchored mid-month: the 15th hits the monthly normal, month ends are halfway', () => {
+  // November normal high 48°F, December 34°F; PM sits shade 4°F under the high.
+  assert.equal(normalTempF('2026-11-15', 'PM'), 44);
+  assert.equal(normalTempF('2026-11-30', 'PM'), 37);
+  // Early November is still between the October and November normals, not already November's.
+  assert.ok(Math.abs(normalTempF('2026-11-01', 'PM') - (63 + (48 - 63) * (16 / 30) - 4)) < 1e-9);
+  // Continuous across a month boundary, and across New Year.
+  assert.ok(Math.abs(normalTempF('2026-10-31', 'AM') - normalTempF('2026-11-01', 'AM')) < 1);
+  assert.ok(Math.abs(normalTempF('2026-12-31', 'AM') - normalTempF('2027-01-01', 'AM')) < 1);
+  // A 38°F mid-November evening is ~6°F colder than normal (it read as normal before).
+  assert.ok(normalTempF('2026-11-15', 'PM') - 38 >= 5);
+});

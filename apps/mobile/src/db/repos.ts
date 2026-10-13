@@ -1,29 +1,60 @@
+import * as FileSystem from 'expo-file-system';
 import type { Hunt, Plan, PlanCard, PressureEvent, Property, Sighting, WeatherSnapshot } from '@msp/engine';
-import { getDb } from './database';
+import { getDb, MAPS_DIR } from './database';
 
 /** Thin JSON-document repositories over the encrypted SQLite database. */
 
 const parse = <T,>(s: string): T => JSON.parse(s) as T;
+
+// --- Map photo paths -------------------------------------------------------
+//
+// iOS can move the app's data container (new UUID in the path) when the app is updated,
+// so an absolute file:// URI saved yesterday may point nowhere today. App-managed photos
+// are stored RELATIVE ('maps/<file>.jpg') and resolved against the current documents
+// directory on every read; old absolute URIs are re-rooted the same way.
+
+/** A photo in the app's documents/maps folder under ANY container path (iOS Documents, Android files). */
+const APP_MAPS_PHOTO = /^file:\/\/.*\/(?:Documents|files)\/maps\/([^/]+)$/;
+
+/** 'maps/<file>' for a photo in the app's maps folder (current or old container path), else the URI unchanged. */
+export function toStoredPhotoUri(uri: string | undefined, documentDirectory: string | null | undefined = FileSystem.documentDirectory): string | undefined {
+  if (!uri || uri.startsWith(MAPS_DIR)) return uri;
+  const docs = documentDirectory ? (documentDirectory.endsWith('/') ? documentDirectory : `${documentDirectory}/`) : null;
+  if (docs && uri.startsWith(`${docs}${MAPS_DIR}`)) return uri.slice(docs.length);
+  const m = APP_MAPS_PHOTO.exec(uri);
+  return m ? `${MAPS_DIR}${m[1]}` : uri;
+}
+
+/** Absolute file:// URI under the CURRENT documents directory for a stored photo path. */
+export function resolvePhotoUri(uri: string | undefined, documentDirectory: string | null | undefined = FileSystem.documentDirectory): string | undefined {
+  const stored = toStoredPhotoUri(uri, documentDirectory);
+  if (!stored || !documentDirectory || !stored.startsWith(MAPS_DIR)) return uri;
+  return `${documentDirectory.endsWith('/') ? documentDirectory : `${documentDirectory}/`}${stored}`;
+}
+
+const withResolvedPhoto = (p: Property): Property => (p.mapImageUri ? { ...p, mapImageUri: resolvePhotoUri(p.mapImageUri) } : p);
 
 // --- Properties -----------------------------------------------------------
 
 export async function listProperties(): Promise<Property[]> {
   const db = await getDb();
   const rows = await db.getAllAsync<{ data: string }>('SELECT data FROM properties ORDER BY updated_at DESC');
-  return rows.map((r) => parse<Property>(r.data));
+  return rows.map((r) => withResolvedPhoto(parse<Property>(r.data)));
 }
 
 export async function getProperty(id: string): Promise<Property | null> {
   const db = await getDb();
   const row = await db.getFirstAsync<{ data: string }>('SELECT data FROM properties WHERE id = ?', id);
-  return row ? parse<Property>(row.data) : null;
+  return row ? withResolvedPhoto(parse<Property>(row.data)) : null;
 }
 
+/** Saves the photo path relative to the documents directory; returns the property with it resolved. */
 export async function saveProperty(p: Property): Promise<Property> {
   const db = await getDb();
   const next = { ...p, updatedAt: new Date().toISOString() };
-  await db.runAsync('INSERT OR REPLACE INTO properties (id, name, updated_at, data) VALUES (?, ?, ?, ?)', next.id, next.name, next.updatedAt, JSON.stringify(next));
-  return next;
+  const stored = next.mapImageUri ? { ...next, mapImageUri: toStoredPhotoUri(next.mapImageUri) } : next;
+  await db.runAsync('INSERT OR REPLACE INTO properties (id, name, updated_at, data) VALUES (?, ?, ?, ?)', next.id, next.name, next.updatedAt, JSON.stringify(stored));
+  return withResolvedPhoto(next);
 }
 
 export async function deleteProperty(id: string): Promise<void> {
@@ -62,6 +93,12 @@ export async function latestPlan(propertyId?: string): Promise<{ plan: Plan; car
 export async function saveHunt(h: Hunt): Promise<void> {
   const db = await getDb();
   await db.runAsync('INSERT OR REPLACE INTO hunts (id, property_id, date, data) VALUES (?, ?, ?, ?)', h.id, h.propertyId, h.date, JSON.stringify(h));
+}
+
+export async function getHunt(id: string): Promise<Hunt | null> {
+  const db = await getDb();
+  const row = await db.getFirstAsync<{ data: string }>('SELECT data FROM hunts WHERE id = ?', id);
+  return row ? parse<Hunt>(row.data) : null;
 }
 
 export async function listHunts(propertyId: string): Promise<Hunt[]> {

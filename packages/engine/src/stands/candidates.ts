@@ -15,7 +15,7 @@ import {
   scale,
   ydsToM,
 } from '../geo/geometry.ts';
-import { distanceToArea } from '../inference/habitat.ts';
+import { BEDDING_MIN_PROB, distanceToArea } from '../inference/habitat.ts';
 
 /**
  * Candidate generation: put stands on the DOWNWIND side of probable travel, offset
@@ -96,6 +96,11 @@ function insideBoundary(p: Vec, property: Property): boolean {
   return !property.boundary || property.boundary.length < 3 || pointInPolygon(p, property.boundary);
 }
 
+/** No-access zones the hunter drew (polygons). The engine never proposes a stand inside one. */
+export function noAccessZones(property: Property): Vec[][] {
+  return (property.accessConstraints ?? []).filter((c) => c.kind === 'no_access_zone' && c.geometry.kind === 'polygon' && c.geometry.points.length >= 3).map((c) => c.geometry.points);
+}
+
 /** Generated stands must sit where a stand can actually go. */
 function unsuitable(p: Vec, features: MapFeature[]): string | null {
   for (const f of features) {
@@ -145,6 +150,7 @@ export function generateCandidates(property: Property, habitat: HabitatSummary, 
   const offset = standOffsetM(ctx.effectiveRangeYds);
   const out: Candidate[] = [];
   const rejected: Array<{ position: Vec; reason: string }> = [];
+  const zones = noAccessZones(property);
 
   for (const c of habitat.corridors.slice(0, 12)) {
     for (const a of anchorsFor(c, ctx)) {
@@ -153,13 +159,18 @@ export function generateCandidates(property: Property, habitat: HabitatSummary, 
       const sides = Math.abs(s) >= 0.25 ? [Math.sign(s)] : [1, -1];
       for (const side of sides) {
         const p = add(a.point, scale(normal, side * offset));
-        const tooClose = habitat.bedding.find((b) => b.probability >= 0.4 && distanceToArea(p, b) < effectiveSetback(b, ctx.setbackM));
+        // Every bedding area the engine keeps gets its setback, however it was inferred.
+        const tooClose = habitat.bedding.find((b) => b.probability >= BEDDING_MIN_PROB && distanceToArea(p, b) < effectiveSetback(b, ctx.setbackM));
         if (tooClose) {
           rejected.push({ position: p, reason: `Inside the ${Math.round(effectiveSetback(tooClose, ctx.setbackM))} m bedding setback` });
           continue;
         }
         if (!insideBoundary(p, property)) {
           rejected.push({ position: p, reason: 'Outside the property boundary' });
+          continue;
+        }
+        if (zones.some((z) => pointInPolygon(p, z))) {
+          rejected.push({ position: p, reason: 'Inside a no-access zone you marked' });
           continue;
         }
         const onTrail = habitat.corridors.find((o) => o.strength >= 0.15 && projectOntoPolyline(p, o.points).distance < ON_TRAIL_M);
@@ -198,7 +209,8 @@ export function generateCandidates(property: Property, habitat: HabitatSummary, 
   const kept = out.slice(0, 40);
   uniqueNames(kept, center);
 
-  // The hunter's own stands are always evaluated, never silently dropped.
+  // The hunter's own stands are always evaluated, never silently dropped: one inside a
+  // no-access zone still comes back, and routing reports it as unreachable.
   const existing: Candidate[] = property.stands.filter((s) => !s.dismissed).map((s) => ({ stand: s, anchorLabel: 'Your stand' }));
   return { candidates: [...existing, ...kept], rejected };
 }

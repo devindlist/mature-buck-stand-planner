@@ -18,7 +18,7 @@ import {
   slicePolyline,
   polylineLength,
 } from './geometry.ts';
-import { geoToLocal, isInUS, localToGeo } from './localFrame.ts';
+import { geoToLocal, isInUS, localToGeo, metersPerDegree } from './localFrame.ts';
 
 const near = (a: number, b: number, eps = 1e-6) => assert.ok(Math.abs(a - b) <= eps, `${a} ≉ ${b}`);
 
@@ -115,7 +115,21 @@ test('local frame round-trips and US check', () => {
   const back = localToGeo(local, origin);
   near(back.lat, p.lat, 1e-9);
   near(back.lon, p.lon, 1e-9);
-  near(local.y, 497.6, 1); // 0.0045° lat ≈ 497.6 m
+  // 0.0045° of latitude at 41.85°N is ~499.8 m (WGS84), not the equatorial 497.6 m.
+  near(local.y, 499.8, 0.2);
   assert.ok(isInUS(origin));
   assert.ok(!isInUS({ lat: 51.5, lon: -0.12 }));
+});
+
+test('local frame uses latitude-dependent degree lengths (WGS84), so N-S and E-W scale alike', () => {
+  // Published WGS84 values: at 45°N one degree is 111,132 m of latitude and 78,847 m of longitude.
+  const m45 = metersPerDegree(45);
+  near(m45.lat, 111_132, 2);
+  near(m45.lon, 78_847, 2);
+  near(metersPerDegree(0).lat, 110_574, 2);
+  // A point 2 km north of a 42°N origin lands 2 km north (the equatorial constant put it ~9 m short).
+  const origin = { lat: 42, lon: -93 };
+  const north = localToGeo({ x: 0, y: 2000 }, origin);
+  near((north.lat - origin.lat) * 111_073, 2000, 1);
+  near(geoToLocal(north, origin).y, 2000, 1e-6);
 });

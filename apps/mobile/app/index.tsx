@@ -1,16 +1,30 @@
-import React from 'react';
-import { Pressable, ScrollView, Text, View } from 'react-native';
-import { router } from 'expo-router';
+import React, { useCallback } from 'react';
+import { AppState, Pressable, ScrollView, Text, View } from 'react-native';
+import { router, useFocusEffect } from 'expo-router';
 import { useAppStore } from '../src/state/store';
-import { useForecast } from '../src/state/useForecast';
+import { useForecast, useForecastFreshness } from '../src/state/useForecast';
 import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Body, Card, Disclaimer, Label, Screen } from '../src/components/ui';
 import { ConditionsStrip } from '../src/components/ConditionsStrip';
-import { propertyLocation } from '../src/services/planning';
+import { StatusIcon } from '../src/components/Icons';
+import { defaultSit, planLocation, useApproxLocations } from '../src/services/planning';
 import { setSetting } from '../src/db/repos';
-import { fmtDate } from '../src/utils/format';
+import { fmtDate, sitOrder } from '../src/utils/format';
 import { font, SPACE, TOUCH } from '../src/theme/theme';
 import { DISCLAIMER } from '@msp/engine';
+
+/**
+ * A draft whose sit has already ended (yesterday's date, or this morning after the
+ * morning sit) moves to the next sit. A sit the hunter picked in the future is kept.
+ * Weather overrides belonged to the ended sit, so they are cleared with it.
+ * Left alone during an active hunt: Hunt mode still needs that sit's wind.
+ */
+function rollDraftForward(): void {
+  const s = useAppStore.getState();
+  if (s.hunt) return;
+  const next = defaultSit(s.activeProperty(), s.draft.phaseOverride);
+  if (sitOrder(s.draft) < sitOrder(next)) s.setDraft({ date: next.date, window: next.window, overrides: {} });
+}
 
 /** Home: conditions strip + one big Plan Hunt button. Everything else is secondary. */
 export default function Home() {
@@ -25,13 +39,36 @@ export default function Home() {
   const hunt = useAppStore((s) => s.hunt);
   const set = useAppStore((s) => s.set);
   useForecast();
+  const { current } = useForecastFreshness();
+  const approx = useApproxLocations((s) => (property ? s.byProperty[property.id] : undefined));
 
-  const loc = property ? propertyLocation(property) : undefined;
+  // Home focus and app resume: never sit on a date that has already passed.
+  useFocusEffect(
+    useCallback(() => {
+      rollDraftForward();
+      const sub = AppState.addEventListener('change', (state) => {
+        if (state === 'active') rollDraftForward();
+      });
+      return () => sub.remove();
+    }, []),
+  );
+
+  const { loc, approximate } = property ? planLocation(property, approx) : { loc: undefined, approximate: false };
 
   return (
     <Screen title="Stand Planner" scroll={false}>
       <ScrollView contentContainerStyle={{ padding: SPACE, paddingBottom: 40 }}>
-        <ConditionsStrip weather={weather} location={loc} date={draft.date} stateCode={property?.stateCode ?? 'IA'} status={weatherStatus} note={weatherError} />
+        <ConditionsStrip
+          weather={current ? weather : null}
+          location={loc}
+          date={draft.date}
+          stateCode={property?.stateCode ?? 'IA'}
+          status={weatherStatus}
+          note={weatherError}
+          overrides={draft.overrides}
+          phaseOverride={draft.phaseOverride}
+          approximateLocation={approximate}
+        />
 
         {hunt ? <BigButton label="Return to active hunt" kind="danger" onPress={() => router.push('/hunt')} style={{ marginTop: SPACE }} /> : null}
 
@@ -74,9 +111,15 @@ export default function Home() {
                     {p.stateCode} · {p.features.filter((f) => f.status === 'active').length} features · {p.stands.filter((s) => !s.dismissed).length} stands ·{' '}
                     {p.calibration?.originGeo ? 'geo-referenced' : 'photo only'}
                   </Text>
+                  {p.analysisMode === 'mock' ? (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 4 }}>
+                      <StatusIcon status="caution" color={t.status.caution} size={16} />
+                      <Text style={{ color: t.status.caution, fontSize: font.xs, fontWeight: '800' }}>SAMPLE FEATURES: not from your photo</Text>
+                    </View>
+                  ) : null}
                 </View>
                 {active ? (
-                  <Pressable accessibilityRole="button" accessibilityLabel={`Edit ${p.name} map`} onPress={() => router.push('/features')} style={{ minHeight: 48, paddingHorizontal: 14, justifyContent: 'center' }}>
+                  <Pressable accessibilityRole="button" accessibilityLabel={`Edit ${p.name} map`} onPress={() => router.push('/features')} style={{ minHeight: TOUCH, paddingHorizontal: 14, justifyContent: 'center' }}>
                     <Text style={{ color: t.accent, fontWeight: '800' }}>Edit map</Text>
                   </Pressable>
                 ) : null}

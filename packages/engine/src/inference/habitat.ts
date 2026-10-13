@@ -216,6 +216,20 @@ export const CROP_ATTRACTION: Record<CropType, PhaseRow> = {
 export const MAST_ATTRACTION: PhaseRow = row(0.55, 0.9, 0.8, 0.5, 0.4, 0.45, 0.25);
 export const FOOD_PLOT_ATTRACTION: PhaseRow = row(0.8, 0.7, 0.65, 0.5, 0.45, 0.75, 0.9);
 
+/** Stage-specific crops that older builds wrote from a USDA CDL guess at calibration time. */
+const LEGACY_CDL_STAGE: Partial<Record<CropType, CropType>> = { soybeans_green: 'soybeans', soybeans_standing: 'soybeans', corn_standing: 'corn' };
+
+/**
+ * The crop to plan with. A crop the hunter set is used as is. A growth stage that was only
+ * guessed from CDL (never confirmed or edited by the hunter) is read as its crop family, so
+ * the stage follows the plan date instead of the day the map was calibrated.
+ */
+export function cropForPlanning(f: MapFeature): CropType {
+  const crop = f.attributes?.crop ?? 'unknown';
+  const cdlGuess = f.source !== 'user' && !f.userEdited && (f.attributes?.crossCheck ?? []).some((n) => n.source === 'CDL');
+  return (cdlGuess && LEGACY_CDL_STAGE[crop]) || crop;
+}
+
 export function inferFood(features: MapFeature[], phase: SeasonPhase): FoodSource[] {
   const out: FoodSource[] = [];
   for (const f of active(features)) {
@@ -224,9 +238,15 @@ export function inferFood(features: MapFeature[], phase: SeasonPhase): FoodSourc
     const reasons: string[] = [];
     if (f.type === 'ag_field') {
       kind = 'ag';
-      const crop = f.attributes?.crop ?? 'unknown';
+      const crop = cropForPlanning(f);
       attraction = CROP_ATTRACTION[crop][phase];
-      reasons.push(crop === 'unknown' ? 'Ag field (crop unknown; set it for better results).' : `Ag field: ${crop.replace(/_/g, ' ')}.`);
+      reasons.push(
+        crop === 'unknown'
+          ? 'Ag field (crop unknown; set it for better results).'
+          : crop === 'corn' || crop === 'soybeans'
+            ? `Ag field: ${crop} (stage estimated from the date; set it for better results).`
+            : `Ag field: ${crop.replace(/_/g, ' ')}.`,
+      );
     } else if (f.type === 'mast_timber') {
       kind = 'mast';
       attraction = MAST_ATTRACTION[phase];

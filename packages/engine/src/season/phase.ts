@@ -134,7 +134,8 @@ export const AM_HOLD_MIN: Record<SeasonPhase, number> = {
 
 /**
  * Rough Midwest normal temperatures (°F) for "colder than normal" scoring.
- * Linear interpolation between monthly anchors (Des Moines-ish climate normals).
+ * Monthly means (Des Moines-ish climate normals), each anchored at the 15th of its
+ * month; days between anchors are interpolated linearly.
  */
 const NORMAL_HIGH_F = [30, 35, 48, 61, 72, 81, 85, 83, 76, 63, 48, 34];
 const NORMAL_LOW_F = [13, 18, 29, 40, 51, 61, 66, 63, 54, 42, 30, 18];
@@ -143,10 +144,9 @@ export function normalTempF(date: ISODate, window: 'AM' | 'PM'): number {
   const [, m, d] = date.split('-').map(Number);
   const arr = window === 'AM' ? NORMAL_LOW_F : NORMAL_HIGH_F;
   const i = m - 1;
-  const j = (i + 1) % 12;
-  const t = (d - 1) / 30;
-  // Anchors are mid-month-ish; interpolation toward next month is close enough for a ±5°F signal.
-  const v = arr[i] * (1 - t) + arr[j] * t;
+  // Before the 15th, blend from last month's anchor; on or after it, toward next month's.
+  const [a, b, t] = d >= 15 ? [arr[i], arr[(i + 1) % 12], (d - 15) / 30] : [arr[(i + 11) % 12], arr[i], (d + 15) / 30];
+  const v = a * (1 - t) + b * t;
   // PM sits happen after the afternoon high; shade it a few degrees down.
   return window === 'PM' ? v - 4 : v + 4;
 }

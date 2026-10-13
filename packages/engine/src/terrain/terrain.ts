@@ -10,27 +10,39 @@ export interface TerrainModel {
   elevationAt(p: Vec): number | undefined;
 }
 
-/** Regular grid of elevations in local meters. Row 0 is the southern edge. */
+/**
+ * Regular grid of elevations in local meters. Row 0 is the southern edge.
+ * Missing samples (a failed 3DEP point) are NaN. A grid that went through JSON (the
+ * on-device cache) has them as null instead: both mean "no data", never 0 m.
+ */
 export class GridTerrain implements TerrainModel {
   readonly origin: Vec;
   readonly cellM: number;
   readonly cols: number;
   readonly rows: number;
-  readonly values: Float64Array | number[];
+  readonly values: Float64Array;
 
-  constructor(origin: Vec, cellM: number, cols: number, rows: number, values: Float64Array | number[]) {
+  constructor(origin: Vec, cellM: number, cols: number, rows: number, values: Float64Array | ArrayLike<number | null | undefined>) {
     if (values.length !== cols * rows) throw new Error('Elevation grid size mismatch');
     this.origin = origin;
     this.cellM = cellM;
     this.cols = cols;
     this.rows = rows;
-    this.values = values;
+    // Float64Array.from(null) would give 0, so map anything that isn't a finite number to NaN.
+    this.values = Float64Array.from(values as ArrayLike<unknown>, (x) => (typeof x === 'number' && Number.isFinite(x) ? x : NaN));
+  }
+
+  /** Share of grid nodes with a real elevation (0..1). */
+  coverage(): number {
+    let n = 0;
+    for (const x of this.values) if (Number.isFinite(x)) n++;
+    return this.values.length ? n / this.values.length : 0;
   }
 
   elevationAt(p: Vec): number | undefined {
     const fx = (p.x - this.origin.x) / this.cellM;
     const fy = (p.y - this.origin.y) / this.cellM;
-    if (fx < 0 || fy < 0 || fx > this.cols - 1 || fy > this.rows - 1) return undefined;
+    if (!(fx >= 0 && fy >= 0 && fx <= this.cols - 1 && fy <= this.rows - 1)) return undefined;
     const x0 = Math.floor(fx);
     const y0 = Math.floor(fy);
     const x1 = Math.min(x0 + 1, this.cols - 1);
@@ -38,8 +50,14 @@ export class GridTerrain implements TerrainModel {
     const tx = fx - x0;
     const ty = fy - y0;
     const v = (x: number, y: number) => this.values[y * this.cols + x];
-    const a = v(x0, y0) * (1 - tx) + v(x1, y0) * tx;
-    const b = v(x0, y1) * (1 - tx) + v(x1, y1) * tx;
+    const q00 = v(x0, y0);
+    const q10 = v(x1, y0);
+    const q01 = v(x0, y1);
+    const q11 = v(x1, y1);
+    // Any missing corner means no elevation here: let the caller fall back to mapped features.
+    if (!Number.isFinite(q00) || !Number.isFinite(q10) || !Number.isFinite(q01) || !Number.isFinite(q11)) return undefined;
+    const a = q00 * (1 - tx) + q10 * tx;
+    const b = q01 * (1 - tx) + q11 * tx;
     const r = a * (1 - ty) + b * ty;
     return Number.isFinite(r) ? r : undefined;
   }

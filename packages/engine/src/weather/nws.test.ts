@@ -154,3 +154,113 @@ test('weather safety gates', () => {
   assert.equal(assessWeather(weather({ tempF: -5, windSpeedMph: 15, windChillF: undefined })).status, 'no_go');
   assert.ok(Math.abs(windChillF(0, 15) - -19) < 1, 'NWS chart: 0°F @ 15 mph ≈ -19°F');
 });
+
+test('weather gates use the worst hour of the sit, not just the snapshot hour', () => {
+  const sit = (gusts: number[], temps: number[], speed = 25) =>
+    gusts.map((g, i) => ({ at: `2026-12-15T2${i}:00:00.000Z`, windFromDeg: 315, windSpeedMph: speed, windGustMph: g, tempF: temps[i] }));
+  // The snapshot (midpoint hour) is calm and mild; the other hours are not.
+  const calmMid = weather({ windGustMph: 15, windSpeedMph: 10, tempF: 55, windChillF: undefined });
+  const gusty = { ...calmMid, hourly: sit([40, 40, 15, 40], [55, 55, 55, 55], 12) };
+  const g = assessWeather(gusty);
+  assert.equal(g.status, 'no_go', 'one-arg call reads the snapshot hourly');
+  assert.match(g.reasons[0], /Gusts to 40 mph during the sit/);
+  assert.equal(assessWeather(calmMid, gusty.hourly).status, 'no_go', 'explicit hourly list');
+  assert.equal(assessWeather(gusty, []).status, 'go', 'an empty list means only the snapshot');
+  // Cold front: the last hour is -2°F in 25 mph wind (wind chill about -27°F).
+  const front = { ...calmMid, tempF: 20, hourly: sit([30, 30, 30, 30], [20, 15, 8, -2]) };
+  const f = assessWeather(front);
+  assert.equal(f.status, 'no_go');
+  assert.ok(f.reasons.some((r) => /Wind chill -2\d°F during the sit/.test(r)), f.reasons.join(' | '));
+  // Heat in any hour of an early-season sit.
+  assert.equal(assessWeather({ ...calmMid, tempF: 80, hourly: sit([10, 10], [80, 88], 5) }).status, 'caution');
+  // Hand-entered gusts and temperature win over the forecast hours.
+  assert.equal(assessWeather({ ...gusty, overriddenFields: ['windGustMph'] }).status, 'go');
+  assert.notEqual(assessWeather({ ...front, overriddenFields: ['tempF', 'windGustMph'] }).status, 'no_go');
+});
+
+test('placeholder conditions (no forecast) are never an all-clear', () => {
+  const d = assessWeather(weather({ placeholder: true }));
+  assert.equal(d.status, 'caution');
+  assert.match(d.reasons.join(' '), /No forecast loaded/);
+  assert.equal(assessWeather(weather()).status, 'go');
+});
+
+test('missing or variable NWS wind directions never read as north', () => {
+  const body = {
+    properties: {
+      periods: [
+        period('2026-11-08T00:00:00Z', 'W', '9 mph', 40),
+        period('2026-11-08T01:00:00Z', 'VRB', '3 mph', 39),
+        period('2026-11-08T02:00:00Z', '', '3 mph', 38),
+        { ...period('2026-11-08T03:00:00Z', 'W', '8 mph', 37), windDirection: undefined },
+        period('2026-11-08T04:00:00Z', 'SW', '8 mph', 36),
+      ],
+    },
+  };
+  const h = parseHourly(body);
+  assert.deepEqual(
+    h.map((x) => [x.windFromDeg, x.windDirKnown]),
+    [
+      [270, true],
+      [270, false],
+      [270, false],
+      [225, false],
+      [225, true],
+    ],
+  );
+  const snap = buildSnapshot(h, null, [], '2026-11-08T00:00:00Z', '2026-11-08T04:00:00Z', 'wx');
+  assert.ok(snap.hourly?.every((x) => x.windFromDeg !== 0), 'no phantom north wind in the shift check');
+  const allVrb = { properties: { periods: [period('2026-11-08T00:00:00Z', 'VRB', '2 mph', 40), period('2026-11-08T01:00:00Z', 'VRB', '2 mph', 40)] } };
+  assert.throws(() => buildSnapshot(parseHourly(allVrb), null, [], '2026-11-08T00:00:00Z', '2026-11-08T02:00:00Z', 'wx'), /variable/);
+});
+
+test('pressure trend never mixes station and sea-level pressure', () => {
+  // Steady air: the barometric and sea-level fields simply differ by ~1.6 hPa.
+  const obs = parseObservations({
+    features: [
+      { properties: { timestamp: '2026-11-07T15:00:00Z', barometricPressure: { value: 101850 }, seaLevelPressure: { value: 101690 } } },
+      { properties: { timestamp: '2026-11-07T16:00:00Z', barometricPressure: { value: 101855 }, seaLevelPressure: { value: 101692 } } },
+      { properties: { timestamp: '2026-11-07T18:00:00Z', barometricPressure: { value: null }, seaLevelPressure: { value: 101690 } } },
+    ],
+  });
+  assert.deepEqual(
+    obs.map((o) => o.field),
+    ['baro', 'baro', 'slp'],
+  );
+  const t = pressureTrend(obs);
+  assert.equal(t.trend, 'steady', 'the barometric series alone is steady (mixing fields read as falling)');
+  assert.equal(t.latest, 1018.55);
+  // Two sea-level readings and one barometric: the sea-level series is used on its own.
+  const slpOnly = parseObservations({
+    features: [
+      { properties: { timestamp: '2026-11-07T15:00:00Z', seaLevelPressure: { value: 101690 } } },
+      { properties: { timestamp: '2026-11-07T17:00:00Z', barometricPressure: { value: 101850 } } },
+      { properties: { timestamp: '2026-11-07T18:00:00Z', seaLevelPressure: { value: 101700 } } },
+    ],
+  });
+  assert.equal(pressureTrend(slpOnly).trend, 'steady');
+  assert.equal(pressureTrend(slpOnly).latest, 1017);
+});
+
+test('the observed pressure trend is not applied to a sit days away', () => {
+  const later = {
+    properties: { periods: [period('2026-11-10T22:00:00Z', 'NW', '9 mph', 40), period('2026-11-10T23:00:00Z', 'NW', '9 mph', 39)] },
+  };
+  const snap = buildSnapshot(parseHourly(later), null, parseObservations(OBS), '2026-11-10T22:00:00Z', '2026-11-11T00:00:00Z', 'wx');
+  assert.equal(snap.pressureTrend, 'unknown');
+  assert.equal(snap.pressureChange3hHpa, undefined);
+  // A sit starting a few hours after the latest observation keeps it.
+  const soon = buildSnapshot(parseHourly(HOURLY), null, parseObservations(OBS), '2026-11-08T00:00:00Z', '2026-11-08T04:00:00Z', 'wx');
+  assert.equal(soon.pressureTrend, 'rising');
+});
+
+test('NWS requests time out instead of hanging, so the app can fall back to its cache', async () => {
+  const hang = ((_url: string, init?: RequestInit) =>
+    new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))))) as unknown as typeof fetch;
+  const t0 = Date.now();
+  await assert.rejects(fetchSnapshot({ lat: 41.85, lon: -93.3 }, '2026-11-08T00:00:00Z', '2026-11-08T04:00:00Z', { fetchFn: hang, userAgent: 'StandPlanner/0.1', timeoutMs: 40 }), /timed out/);
+  // Even a fetch that ignores the abort signal gives up.
+  const deaf = (() => new Promise(() => {})) as unknown as typeof fetch;
+  await assert.rejects(fetchSnapshot({ lat: 41.85, lon: -93.3 }, '2026-11-08T00:00:00Z', '2026-11-08T04:00:00Z', { fetchFn: deaf, userAgent: 'StandPlanner/0.1', timeoutMs: 40 }), /timed out/);
+  assert.ok(Date.now() - t0 < 2000);
+});

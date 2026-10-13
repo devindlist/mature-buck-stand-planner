@@ -9,6 +9,12 @@ import { windChillF } from '../safety/safety.ts';
  */
 export const NWS_BASE = 'https://api.weather.gov';
 
+/** Per-request timeout. React Native's fetch never times out on its own, so a dead connection would hang forever. */
+export const NWS_TIMEOUT_MS = 15_000;
+
+/** A pressure trend observed more than this long before the sit starts says nothing about the sit. */
+export const PRESSURE_TREND_MAX_LEAD_MS = 6 * 3_600_000;
+
 export type FetchFn = typeof fetch;
 
 export interface NwsPoint {
@@ -40,6 +46,11 @@ export interface HourlyPeriod {
   tempF: number;
   windSpeedMph: number;
   windFromDeg: number;
+  /**
+   * False when NWS gave no usable direction (blank, "VRB" variable): windFromDeg was
+   * borrowed from the nearest hour that has one, so it never reads as a shift to north.
+   */
+  windDirKnown: boolean;
   precipChancePct: number;
   shortForecast: string;
 }
@@ -53,15 +64,29 @@ export function parseWindSpeed(s: unknown): number {
 
 export function parseHourly(body: unknown): HourlyPeriod[] {
   const periods = (body as { properties?: { periods?: Array<Record<string, unknown>> } })?.properties?.periods ?? [];
-  return periods.map((p) => {
+  const dirs = periods.map((p) => (typeof p.windDirection === 'string' ? compassToDeg(p.windDirection) : undefined));
+  // Unknown or variable direction: borrow the nearest hour's direction (earlier hour on a tie)
+  // rather than defaulting to north, which would read as a wind shift.
+  const nearestKnown = (i: number): number | undefined => {
+    for (let d = 1; d < dirs.length; d++) {
+      const before = dirs[i - d];
+      if (before !== undefined) return before;
+      const after = dirs[i + d];
+      if (after !== undefined) return after;
+    }
+    return undefined;
+  };
+  return periods.map((p, i) => {
     const unit = p.temperatureUnit === 'C' ? 'C' : 'F';
     const t = Number(p.temperature);
+    const dir = dirs[i];
     return {
       startTime: String(p.startTime),
       endTime: String(p.endTime),
       tempF: unit === 'C' ? (t * 9) / 5 + 32 : t,
       windSpeedMph: parseWindSpeed(p.windSpeed),
-      windFromDeg: compassToDeg(String(p.windDirection ?? 'N')) ?? 0,
+      windFromDeg: dir ?? nearestKnown(i) ?? 0,
+      windDirKnown: dir !== undefined,
       precipChancePct: Number((p.probabilityOfPrecipitation as { value?: number } | undefined)?.value ?? 0),
       shortForecast: String(p.shortForecast ?? ''),
     };
@@ -116,6 +141,12 @@ export function parseGridData(body: unknown): GridData {
 export interface PressureObs {
   atMs: number;
   hPa: number;
+  /**
+   * Which NWS field the value came from: station barometric pressure or the METAR
+   * sea-level pressure. They are reduced differently (often 0.5+ hPa apart), so a
+   * trend never mixes them. Missing = barometric.
+   */
+  field?: 'baro' | 'slp';
 }
 
 export function parseObservations(body: unknown): PressureObs[] {
@@ -124,15 +155,20 @@ export function parseObservations(body: unknown): PressureObs[] {
   for (const f of feats) {
     const pr = f.properties;
     if (!pr) continue;
-    const pa = (pr.barometricPressure as { value?: number | null } | undefined)?.value ?? (pr.seaLevelPressure as { value?: number | null } | undefined)?.value;
-    if (typeof pa !== 'number') continue;
-    out.push({ atMs: Date.parse(String(pr.timestamp)), hPa: pa / 100 });
+    const baro = (pr.barometricPressure as { value?: number | null } | undefined)?.value;
+    const slp = (pr.seaLevelPressure as { value?: number | null } | undefined)?.value;
+    const atMs = Date.parse(String(pr.timestamp));
+    if (typeof baro === 'number') out.push({ atMs, hPa: baro / 100, field: 'baro' });
+    else if (typeof slp === 'number') out.push({ atMs, hPa: slp / 100, field: 'slp' });
   }
   return out.sort((a, b) => a.atMs - b.atMs);
 }
 
-export function pressureTrend(obs: PressureObs[]): { trend: PressureTrend; change3h?: number; latest?: number } {
-  if (obs.length < 2) return { trend: 'unknown', latest: obs[0]?.hPa };
+export function pressureTrend(all: PressureObs[]): { trend: PressureTrend; change3h?: number; latest?: number } {
+  // One field for the whole series: barometric when at least two readings have it, else sea-level.
+  const baro = all.filter((o) => o.field !== 'slp');
+  const obs = baro.length >= 2 ? baro : all.filter((o) => o.field === 'slp');
+  if (obs.length < 2) return { trend: 'unknown', latest: all[all.length - 1]?.hPa };
   const latest = obs[obs.length - 1];
   const target = latest.atMs - 3 * 3_600_000;
   const earlier = obs.reduce((best, o) => (Math.abs(o.atMs - target) < Math.abs(best.atMs - target) ? o : best), obs[0]);
@@ -155,7 +191,9 @@ export function precipFromForecast(shortForecast: string, popPct: number): Preci
 
 /**
  * Build the snapshot for a sit: conditions at the sit midpoint plus the hourly
- * winds across the window (for shift detection). Precip uses the worst hour.
+ * winds, gusts and temperatures across the window (for shift detection and the
+ * worst-hour weather gates). Precip uses the worst hour. The pressure trend is the
+ * one observed now, so it is only used when the sit starts within a few hours.
  */
 export function buildSnapshot(
   hourly: HourlyPeriod[],
@@ -170,6 +208,7 @@ export function buildSnapshot(
   const mid = (s + e) / 2;
   const inWindow = hourly.filter((h) => Date.parse(h.endTime) > s && Date.parse(h.startTime) < e);
   if (!inWindow.length) throw new Error('No forecast for that hunt window yet. NWS hourly forecasts run about 7 days out.');
+  if (!inWindow.some((h) => h.windDirKnown)) throw new Error('NWS lists the wind as variable for your whole sit, so there is no direction to plan around. Set the wind by hand.');
   const at = inWindow.reduce((best, h) => (Math.abs(Date.parse(h.startTime) - mid) < Math.abs(Date.parse(best.startTime) - mid) ? h : best), inWindow[0]);
   const gustAt = (ms: number) => (grid ? gridValueAt(grid.windGustMph, ms) : undefined);
   const hourlyWinds: HourlyWind[] = inWindow.map((h) => ({
@@ -181,7 +220,9 @@ export function buildSnapshot(
   }));
   const severity: PrecipType[] = ['none', 'rain', 'snow', 'sleet', 'freezing_rain', 'thunderstorm'];
   const precipType = inWindow.map((h) => precipFromForecast(h.shortForecast, h.precipChancePct)).reduce((w, p) => (severity.indexOf(p) > severity.indexOf(w) ? p : w), 'none' as PrecipType);
-  const p = pressureTrend(obs);
+  const latestObsMs = obs.length ? Math.max(...obs.map((o) => o.atMs)) : undefined;
+  // Today's observed trend says nothing about a sit tomorrow or later in the week.
+  const p = latestObsMs !== undefined && s - latestObsMs <= PRESSURE_TREND_MAX_LEAD_MS ? pressureTrend(obs) : { trend: 'unknown' as PressureTrend, change3h: undefined, latest: undefined };
   const gust = gustAt(Date.parse(at.startTime));
   return {
     id,
@@ -221,12 +262,36 @@ export function applyOverrides(w: WeatherSnapshot, o: Partial<Pick<WeatherSnapsh
 export interface NwsClientOptions {
   fetchFn?: FetchFn;
   userAgent: string;
+  /** Per-request timeout (ms). Default NWS_TIMEOUT_MS. */
+  timeoutMs?: number;
+}
+
+/**
+ * Runs a request with a hard deadline: aborts it (when the fetch supports AbortSignal)
+ * and rejects even if the fetch ignores the signal, so callers can fall back to cache.
+ */
+async function withTimeout<T>(ms: number, label: string, run: (signal: AbortSignal | undefined) => Promise<T>): Promise<T> {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl?.abort();
+      reject(new Error(`${label} timed out after ${Math.round(ms / 1000)} s`));
+    }, ms);
+  });
+  try {
+    return await Promise.race([run(ctrl?.signal), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function getJson(url: string, opts: NwsClientOptions): Promise<unknown> {
-  const res = await (opts.fetchFn ?? fetch)(url, { headers: { 'User-Agent': opts.userAgent, Accept: 'application/geo+json' } });
-  if (!res.ok) throw new Error(`NWS ${res.status} for ${url}`);
-  return res.json();
+  return withTimeout(opts.timeoutMs ?? NWS_TIMEOUT_MS, 'NWS request', async (signal) => {
+    const res = await (opts.fetchFn ?? fetch)(url, { headers: { 'User-Agent': opts.userAgent, Accept: 'application/geo+json' }, signal });
+    if (!res.ok) throw new Error(`NWS ${res.status} for ${url}`);
+    return res.json();
+  });
 }
 
 export async function fetchSnapshot(loc: LatLon, windowStartIso: string, windowEndIso: string, opts: NwsClientOptions): Promise<{ snapshot: WeatherSnapshot; point: NwsPoint }> {

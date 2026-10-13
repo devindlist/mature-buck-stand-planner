@@ -16,7 +16,7 @@ import type {
   WeatherSnapshot,
 } from '../models.ts';
 import { clamp, compass16, dist, mToYds, pointGeometryDistance, projectOntoPolyline, round, ydsToM } from '../geo/geometry.ts';
-import { distanceToArea } from '../inference/habitat.ts';
+import { BEDDING_MIN_PROB, distanceToArea } from '../inference/habitat.ts';
 import { normalTempF } from '../season/phase.ts';
 import { combinedModifierPoints } from '../modifiers/modifiers.ts';
 import { effectiveSetback } from './candidates.ts';
@@ -69,8 +69,18 @@ export function scoreWindFit(marginDeg: number, gustSpreadMph: number, light: bo
 
 // --- Access stealth ---------------------------------------------------------
 
-export function scoreAccess(entry: Route | null, exit: Route | null, noAccess: boolean): ScoreComponent {
+/**
+ * `unreachable`: start points exist but no legal walk reaches the stand (it sits in a
+ * no-access zone, or water, a no-access zone or a neighbor line cuts it off). That is
+ * zero stealth, not an unknown, so it never gets the benefit of the doubt.
+ */
+export function scoreAccess(entry: Route | null, exit: Route | null, noAccess: boolean, unreachable = false): ScoreComponent {
   const reasons: string[] = [];
+  if (unreachable) {
+    return comp('accessStealth', 'Access stealth', WEIGHTS.accessStealth, 0, [
+      "No legal walking route from your access points to this stand: a no-access zone, water, a neighbor's line or the property line is in the way.",
+    ]);
+  }
   if (noAccess || !entry) {
     return comp('accessStealth', 'Access stealth', WEIGHTS.accessStealth, 8, ['No access point or road mapped, so the route could not be checked. Mark where you park.']);
   }
@@ -101,6 +111,11 @@ export function scoreAccess(entry: Route | null, exit: Route | null, noAccess: b
 export interface StandContext {
   /** Corridors within effective range, nearest first. */
   corridors: Array<{ corridor: Corridor; distanceM: number; along: number }>;
+  /**
+   * The bedding this stand presses hardest: the smallest distance relative to that bed's
+   * setback (doe bedding gets a lighter one). A buck bed 150 m away matters more than a doe
+   * bed 130 m away, so the setback check and score never look past it.
+   */
   nearestBedding: { area: BeddingArea; distanceM: number } | null;
   nearestFoodM: number;
 }
@@ -115,9 +130,16 @@ export function standContext(p: Vec, habitat: HabitatSummary, effectiveRangeYds:
     .filter((x) => x.distanceM <= reach)
     .sort((a, b) => a.distanceM - b.distanceM);
   let nearestBedding: StandContext['nearestBedding'] = null;
+  let worstRatio = Infinity;
   for (const b of habitat.bedding) {
+    if (b.probability < BEDDING_MIN_PROB) continue;
     const d = distanceToArea(p, b);
-    if (!nearestBedding || d < nearestBedding.distanceM) nearestBedding = { area: b, distanceM: d };
+    // Setbacks scale together with the phase, so the ratio needs only the per-kind factor.
+    const ratio = d / effectiveSetback(b, 1);
+    if (ratio < worstRatio) {
+      worstRatio = ratio;
+      nearestBedding = { area: b, distanceM: d };
+    }
   }
   const nearestFoodM = habitat.food.reduce((m, f) => Math.min(m, distanceToArea(p, f)), Infinity);
   return { corridors, nearestBedding, nearestFoodM };

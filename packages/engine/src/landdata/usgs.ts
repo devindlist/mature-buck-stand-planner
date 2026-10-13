@@ -17,11 +17,32 @@ export const NLCD_WMS_URL = 'https://www.mrlc.gov/geoserver/mrlc_display/wms';
 export const NLCD_LAYER = 'NLCD_2021_Land_Cover_L48';
 export const CDL_URL = 'https://nassgeodata.gmu.edu/axis2/services/CDLService/GetCDLValue';
 
-export async function fetchElevationM(p: LatLon, fetchFn: FetchFn = fetch): Promise<number | undefined> {
+/**
+ * Per-request timeout. React Native's fetch has no timeout of its own, and one hung
+ * request (of ~400 for an elevation grid) would stall "Generate plan" forever. A
+ * timeout rejects (it is not cached as "no data"), so callers fall back and retry later.
+ */
+export const LANDDATA_TIMEOUT_MS = 10_000;
+
+async function fetchWithTimeout<T>(fetchFn: FetchFn, url: string, timeoutMs: number, read: (res: Response) => Promise<T>): Promise<T> {
+  const ctrl = typeof AbortController === 'function' ? new AbortController() : undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      ctrl?.abort();
+      reject(new Error(`Land-data request timed out after ${Math.round(timeoutMs / 1000)} s`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([fetchFn(url, ctrl ? { signal: ctrl.signal } : undefined).then(read), deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export async function fetchElevationM(p: LatLon, fetchFn: FetchFn = fetch, timeoutMs = LANDDATA_TIMEOUT_MS): Promise<number | undefined> {
   const url = `${EPQS_URL}?x=${p.lon.toFixed(6)}&y=${p.lat.toFixed(6)}&wkid=4326&units=Meters&includeDate=false`;
-  const res = await fetchFn(url);
-  if (!res.ok) return undefined;
-  return parseEpqs(await res.json());
+  return fetchWithTimeout(fetchFn, url, timeoutMs, async (res) => (res.ok ? parseEpqs(await res.json()) : undefined));
 }
 
 export function parseEpqs(body: unknown): number | undefined {
@@ -31,7 +52,7 @@ export function parseEpqs(body: unknown): number | undefined {
   return Number.isFinite(n) && n > -10000 ? n : undefined;
 }
 
-export async function fetchNlcdClass(p: LatLon, fetchFn: FetchFn = fetch, layer = NLCD_LAYER): Promise<number | undefined> {
+export async function fetchNlcdClass(p: LatLon, fetchFn: FetchFn = fetch, layer = NLCD_LAYER, timeoutMs = LANDDATA_TIMEOUT_MS): Promise<number | undefined> {
   const d = 0.0005;
   const params = new URLSearchParams({
     service: 'WMS',
@@ -47,9 +68,7 @@ export async function fetchNlcdClass(p: LatLon, fetchFn: FetchFn = fetch, layer 
     x: '1',
     y: '1',
   });
-  const res = await fetchFn(`${NLCD_WMS_URL}?${params.toString()}`);
-  if (!res.ok) return undefined;
-  return parseNlcdFeatureInfo(await res.json());
+  return fetchWithTimeout(fetchFn, `${NLCD_WMS_URL}?${params.toString()}`, timeoutMs, async (res) => (res.ok ? parseNlcdFeatureInfo(await res.json()) : undefined));
 }
 
 export function parseNlcdFeatureInfo(body: unknown): number | undefined {
@@ -62,11 +81,9 @@ export function parseNlcdFeatureInfo(body: unknown): number | undefined {
   return undefined;
 }
 
-export async function fetchCdlCode(p: LatLon, year: number, fetchFn: FetchFn = fetch): Promise<number | undefined> {
+export async function fetchCdlCode(p: LatLon, year: number, fetchFn: FetchFn = fetch, timeoutMs = LANDDATA_TIMEOUT_MS): Promise<number | undefined> {
   const { x, y } = toConusAlbers(p);
-  const res = await fetchFn(`${CDL_URL}?year=${year}&x=${x.toFixed(1)}&y=${y.toFixed(1)}`);
-  if (!res.ok) return undefined;
-  return parseCdlValue(await res.text());
+  return fetchWithTimeout(fetchFn, `${CDL_URL}?year=${year}&x=${x.toFixed(1)}&y=${y.toFixed(1)}`, timeoutMs, async (res) => (res.ok ? parseCdlValue(await res.text()) : undefined));
 }
 
 /** CropScape responds with an XML wrapper around a loose JSON-ish object: `{..., value: 5, category: "Soybeans", ...}`. */

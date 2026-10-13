@@ -124,16 +124,20 @@ export function nlcdCheck(type: MapFeature['type'], code: number): CrossCheckNot
 /**
  * CDL is published for the PREVIOUS season. Midwest ground is usually in a
  * corn–soybean rotation, so last year's corn suggests beans this year and vice versa.
+ *
+ * Only the crop FAMILY ('corn' / 'soybeans') is returned for row crops. The result is
+ * stored on the feature at calibration time, so a growth stage guessed from that day
+ * (green beans in September) would be frozen for the whole season. The family lets
+ * food value follow the season phase at plan time instead.
  */
 export function cropFromCdl(code: number, cdlYear: number, date: ISODate): { crop: CropType; detail: string } | null {
   const year = Number(date.slice(0, 4));
-  const month = Number(date.slice(5, 7));
   const rotated = cdlYear < year;
   let base: 'corn' | 'soy' | null = code === 1 ? 'corn' : code === 5 || code === 26 ? 'soy' : null;
   if (base && rotated) base = base === 'corn' ? 'soy' : 'corn';
-  const early = month === 9 || (month === 10 && Number(date.slice(8, 10)) < 10);
-  if (base === 'soy') return { crop: early ? 'soybeans_green' : 'soybeans_standing', detail: rotated ? `CDL ${cdlYear} showed corn. Rotation suggests beans this year.` : 'CDL shows soybeans.' };
-  if (base === 'corn') return { crop: 'corn_standing', detail: rotated ? `CDL ${cdlYear} showed soybeans. Rotation suggests corn this year.` : 'CDL shows corn.' };
+  const stage = 'Growth stage is estimated from the hunt date.';
+  if (base === 'soy') return { crop: 'soybeans', detail: `${rotated ? `CDL ${cdlYear} showed corn. Rotation suggests beans this year.` : 'CDL shows soybeans.'} ${stage}` };
+  if (base === 'corn') return { crop: 'corn', detail: `${rotated ? `CDL ${cdlYear} showed soybeans. Rotation suggests corn this year.` : 'CDL shows corn.'} ${stage}` };
   if (code === 36 || code === 37) return { crop: 'alfalfa_clover', detail: 'CDL shows alfalfa/hay.' };
   if (code === 24) return { crop: 'winter_wheat', detail: 'CDL shows winter wheat.' };
   return null;

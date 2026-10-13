@@ -1,5 +1,6 @@
-import type { Plan, StandRecommendation } from './models.ts';
+import type { Plan, StandRecommendation, WeatherSnapshot } from './models.ts';
 import { compass16, downwindBearing, mToYds } from './geo/geometry.ts';
+import { UNREACHABLE_RISK } from './planner.ts';
 
 /**
  * Offline plan card: a compact, render-ready summary of a plan that the app stores
@@ -24,6 +25,8 @@ export interface PlanCardStand {
   risks: string[];
   confidence: string;
   backupNote?: string;
+  /** Wind-shift fallback backup only: the hypothetical wind its dial, plume and routes assume, e.g. "N". */
+  assumedWind?: string;
   /** The hunter's own stand shown outside the top 3. */
   yours?: boolean;
 }
@@ -52,8 +55,8 @@ function windList(rec: StandRecommendation, status: 'good' | 'bad'): string {
   return list.length ? list.join(', ') : 'none';
 }
 
-function routeLine(r: StandRecommendation['entryRoute']): string {
-  if (!r) return 'No access point mapped';
+function routeLine(r: StandRecommendation['entryRoute'], rec: StandRecommendation): string {
+  if (!r) return rec.risks.some((x) => x.text === UNREACHABLE_RISK) ? 'No legal route from your access points' : 'No access point mapped';
   const flag = r.worstStatus === 'avoid' ? ' ⚠ crosses a red zone' : r.worstStatus === 'caution' ? ' • caution sections' : ' • clean';
   return `From ${r.startLabel}, ${Math.round(mToYds(r.lengthM))} yds${flag}`;
 }
@@ -71,16 +74,28 @@ function standCard(rec: StandRecommendation, fmt: TimeFormatter): PlanCardStand 
     sitWindow: `${fmt(rec.sitWindow.start)}–${fmt(rec.sitWindow.end)}`,
     goodWinds: windList(rec, 'good'),
     badWinds: windList(rec, 'bad'),
-    entry: routeLine(rec.entryRoute),
-    exit: routeLine(rec.exitRoute),
+    entry: routeLine(rec.entryRoute, rec),
+    exit: routeLine(rec.exitRoute, rec),
     shot:
-      (shot.expectedShotYds !== null ? `Expect ~${shot.expectedShotYds} yds ${compass16(shot.primaryBearingDeg ?? 0)}` : 'No travel in range') +
+      (shot.expectedShotYds !== null
+        ? `Expect ~${shot.expectedShotYds} yds ${compass16(shot.primaryBearingDeg ?? 0)}`
+        : shot.primaryBearingDeg !== null
+          ? `Travel ${compass16(shot.primaryBearingDeg)} is beyond your range, so no shot unless he comes closer`
+          : 'No travel in range') +
       `; max ${shot.effectiveRangeYds} yds` +
       (noShot.length ? `; NO SHOT toward ${noShot.join(', ')}` : ''),
     risks: rec.risks.map((r) => r.text),
     confidence: `${rec.confidence.level} (${Math.round(rec.confidence.value * 100)}%)`,
     backupNote: rec.backupNote,
+    assumedWind: rec.assumedWindFromDeg !== undefined ? compass16(rec.assumedWindFromDeg) : undefined,
   };
+}
+
+/** Where the wind numbers came from, so defaults are never mistaken for a forecast. */
+function windSourceTag(w: WeatherSnapshot): string {
+  if (w.placeholder) return ' (defaults, not a forecast: confirm before you go)';
+  if (w.source === 'manual') return ' (entered by you, not a forecast)';
+  return w.overriddenFields.length ? ' (edited by you)' : '';
 }
 
 export function buildPlanCard(plan: Plan, propertyName: string, fmt: TimeFormatter = defaultFmt): PlanCard {
@@ -94,7 +109,7 @@ export function buildPlanCard(plan: Plan, propertyName: string, fmt: TimeFormatt
     phase: plan.phase.label + (plan.phase.source === 'user' ? ' (your override)' : ''),
     legalHours: `${fmt(plan.legal.start)}–${fmt(plan.legal.end)}`,
     sunLine: `Sunrise ${fmt(plan.sun.sunrise)} · Sunset ${fmt(plan.sun.sunset)}`,
-    windLine: `${compass16(w.windFromDeg)} ${Math.round(w.windSpeedMph)} mph, gusts ${Math.round(w.windGustMph)}. Scent blows ${compass16(downwindBearing(w.windFromDeg))}${w.overriddenFields.length ? ' (edited by you)' : ''}`,
+    windLine: `${compass16(w.windFromDeg)} ${Math.round(w.windSpeedMph)} mph, gusts ${Math.round(w.windGustMph)}. Scent blows ${compass16(downwindBearing(w.windFromDeg))}${windSourceTag(w)}`,
     weatherLine: `${Math.round(w.tempF)}°F${w.cloudCoverPct !== undefined ? ` · ${Math.round(w.cloudCoverPct)}% cloud` : ''}${w.precipType !== 'none' ? ` · ${w.precipType.replace('_', ' ')}` : ''} · pressure ${w.pressureTrend}`,
     weatherStatus: plan.weatherDecision.status,
     stands,
@@ -112,6 +127,7 @@ export function planCardText(card: PlanCard): string {
   for (const s of card.stands) {
     lines.push(`${s.isBackup ? 'BACKUP' : s.yours ? 'YOUR STAND' : `#${s.rank}`} ${s.name}: ${s.score}/100 [${s.status.toUpperCase().replace('_', '-')}]`);
     if (s.backupNote) lines.push(`  ${s.backupNote}`);
+    if (s.assumedWind) lines.push(`  Wind dial and routes assume a ${s.assumedWind} wind.`);
     lines.push(`  ${s.reason}`, `  Sit ${s.sitWindow}`, `  Good winds: ${s.goodWinds} | Bad: ${s.badWinds}`, `  In: ${s.entry}`, `  Out: ${s.exit}`, `  Shot: ${s.shot}`);
     for (const r of s.risks) lines.push(`  Risk: ${r}`);
     lines.push('');

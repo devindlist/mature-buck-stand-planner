@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fetchCdlCode, fetchElevationM, parseCdlValue, parseEpqs, parseNlcdFeatureInfo, toConusAlbers } from './usgs.ts';
+import { fetchCdlCode, fetchElevationM, fetchNlcdClass, parseCdlValue, parseEpqs, parseNlcdFeatureInfo, toConusAlbers } from './usgs.ts';
 import { shotLanes, laneFor } from '../safety/safety.ts';
 import type { MapFeature } from '../models.ts';
 
@@ -54,4 +54,19 @@ test('shot lanes: no-shot toward a road within weapon danger distance', () => {
   const farRoad: MapFeature = { ...road, geometry: { kind: 'line', points: [{ x: -500, y: -400 }, { x: 500, y: -400 }] } };
   assert.equal(laneFor(shotLanes({ x: 0, y: 0 }, [farRoad], 'bow', 30), 180).status, 'open', 'bow is safe at 400 m');
   assert.equal(laneFor(shotLanes({ x: 0, y: 0 }, [farRoad], 'rifle', 200), 180).status, 'no_shot', 'rifle is not');
+});
+
+test('land-data requests time out (rejecting, so nothing is cached as no-data)', async () => {
+  const hang = ((_url: string, init?: RequestInit) =>
+    new Promise((_, reject) => init?.signal?.addEventListener('abort', () => reject(new Error('aborted'))))) as unknown as typeof fetch;
+  const deaf = (() => new Promise(() => {})) as unknown as typeof fetch;
+  const p = { lat: 41.85, lon: -93.3 };
+  await assert.rejects(fetchElevationM(p, hang, 30), /timed out/);
+  await assert.rejects(fetchElevationM(p, deaf, 30), /timed out/);
+  await assert.rejects(fetchNlcdClass(p, deaf, undefined, 30), /timed out/);
+  await assert.rejects(fetchCdlCode(p, 2025, deaf, 30), /timed out/);
+  // A normal response is unaffected, and existing call signatures still work.
+  const ok = (async () => new Response(JSON.stringify({ value: 300 }), { status: 200 })) as unknown as typeof fetch;
+  assert.equal(await fetchElevationM(p, ok), 300);
+  assert.equal(await fetchElevationM(p, ok, 30), 300);
 });

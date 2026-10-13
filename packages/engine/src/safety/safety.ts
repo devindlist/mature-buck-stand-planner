@@ -1,4 +1,4 @@
-import type { Decision, MapFeature, Vec, WeaponType, WeatherSnapshot, ShotLane } from '../models.ts';
+import type { Decision, HourlyWind, MapFeature, Vec, WeaponType, WeatherSnapshot, ShotLane } from '../models.ts';
 import { pointGeometryDistance, sectorPolygon, shapeDistance, ydsToM } from '../geo/geometry.ts';
 
 export const DISCLAIMER =
@@ -25,19 +25,61 @@ export function planReminders(stateCode: string, weapon: WeaponType): string[] {
   return r;
 }
 
-/** Hard weather gates. Tree-stand safety beats any score. */
-export function assessWeather(w: WeatherSnapshot): Decision {
+/**
+ * Hard weather gates. Tree-stand safety beats any score.
+ *
+ * The gates look at the WORST hour of the sit, not just the snapshot hour: a 40 mph
+ * gust at 3 PM is no safer because the 4 PM midpoint is calm. `hourly` is the forecast
+ * through the sit window; it defaults to the snapshot's own hourly list, so the one-
+ * argument call keeps working. Values the hunter typed in win over the forecast.
+ */
+export function assessWeather(w: WeatherSnapshot, hourly: HourlyWind[] | undefined = w.hourly): Decision {
   const noGo: string[] = [];
   const caution: string[] = [];
+  const hours = hourly ?? [];
+  const byHand = (field: string) => w.overriddenFields.includes(field);
+  let gust = w.windGustMph;
+  let gustFromForecast = false;
+  if (!byHand('windGustMph')) {
+    for (const h of hours) {
+      const g = Math.max(h.windGustMph ?? 0, h.windSpeedMph);
+      if (g > gust) {
+        gust = g;
+        gustFromForecast = true;
+      }
+    }
+  }
+  let chill = w.windChillF ?? windChillF(w.tempF, w.windSpeedMph);
+  let chillFromForecast = false;
+  let maxTemp = w.tempF;
+  if (!byHand('tempF')) {
+    for (const h of hours) {
+      if (h.tempF === undefined) continue;
+      const c = windChillF(h.tempF, h.windSpeedMph);
+      if (c < chill) {
+        chill = c;
+        chillFromForecast = true;
+      }
+      maxTemp = Math.max(maxTemp, h.tempF);
+    }
+  }
+  const during = (fromForecast: boolean) => (fromForecast ? ' during the sit' : '');
   if (w.precipType === 'thunderstorm') noGo.push('Thunderstorms forecast. Never be in a tree stand with lightning around.');
   if (w.precipType === 'freezing_rain') noGo.push('Freezing rain. Ladders, steps and platforms ice over.');
   if (w.precipType === 'sleet') caution.push('Sleet. Steps and platforms get slick, so clear them and climb slowly.');
-  if (w.windGustMph >= 35) noGo.push(`Gusts to ${Math.round(w.windGustMph)} mph. Tree stands and dead limbs are dangerous.`);
-  else if (w.windGustMph >= 25) caution.push(`Gusts to ${Math.round(w.windGustMph)} mph. Pick a healthy, sheltered tree or a ground blind.`);
-  const chill = w.windChillF ?? windChillF(w.tempF, w.windSpeedMph);
-  if (chill <= -15) noGo.push(`Wind chill ${Math.round(chill)}°F. Frostbite can set in within 30 minutes.`);
-  else if (chill <= 5) caution.push(`Wind chill ${Math.round(chill)}°F. Dress for hypothermia risk and shorten the sit.`);
-  if (w.tempF >= 85) caution.push(`${Math.round(w.tempF)}°F. Heat risk, and meat spoils fast, so plan quick recovery.`);
+  if (gust >= 35) noGo.push(`Gusts to ${Math.round(gust)} mph${during(gustFromForecast)}. Tree stands and dead limbs are dangerous.`);
+  else if (gust >= 25) caution.push(`Gusts to ${Math.round(gust)} mph${during(gustFromForecast)}. Pick a healthy, sheltered tree or a ground blind.`);
+  if (chill <= -15) noGo.push(`Wind chill ${Math.round(chill)}°F${during(chillFromForecast)}. Frostbite can set in within 30 minutes.`);
+  else if (chill <= 5) caution.push(`Wind chill ${Math.round(chill)}°F${during(chillFromForecast)}. Dress for hypothermia risk and shorten the sit.`);
+  if (maxTemp >= 85) caution.push(`${Math.round(maxTemp)}°F. Heat risk, and meat spoils fast, so plan quick recovery.`);
+  // Defaults are never an all-clear: nobody checked the sky for gusts, lightning or cold.
+  if (w.placeholder) {
+    caution.push(
+      w.overriddenFields.length
+        ? 'No forecast loaded. Only what you entered is real, so check gusts, lightning and temperature yourself before you climb.'
+        : 'No forecast loaded. These are default conditions, so check wind, gusts, lightning and temperature yourself before you climb.',
+    );
+  }
   if (noGo.length) return { status: 'no_go', reasons: [...noGo, ...caution] };
   if (caution.length) return { status: 'caution', reasons: caution };
   return { status: 'go', reasons: ['No weather hazards in the forecast.'] };

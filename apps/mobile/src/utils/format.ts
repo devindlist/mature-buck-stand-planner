@@ -9,13 +9,29 @@ export function todayLocal(d = new Date()): string {
   return `${y}-${m}-${day}`;
 }
 
-/** The next sit from now: before 4 AM → this morning; before 2 PM → this evening; else tomorrow morning. */
-export function nextSit(now = new Date()): { date: string; window: 'AM' | 'PM' } {
-  const h = now.getHours();
-  if (h < 4) return { date: todayLocal(now), window: 'AM' };
-  if (h < 14) return { date: todayLocal(now), window: 'PM' };
-  return { date: addDays(todayLocal(now), 1), window: 'AM' };
+/** Without sun times: the morning sit is treated as over at 10 AM, the evening sit at 6 PM. */
+const DEFAULT_AM_END_HOUR = 10;
+const DEFAULT_PM_END_HOUR = 18;
+
+/**
+ * The next sit that has not ended yet: this morning until the morning sit is over,
+ * then this evening until legal light ends, then tomorrow morning. A hunter opening
+ * the app at 5:30 AM gets this morning's sit, not the evening's.
+ * `ends` (ISO times for today) come from the property's sun times when known.
+ */
+export function nextSit(now = new Date(), ends?: { amEnd: string; pmEnd: string }): { date: string; window: 'AM' | 'PM' } {
+  const today = todayLocal(now);
+  const at = (hour: number) => new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour).getTime();
+  const amEnd = ends ? Date.parse(ends.amEnd) : at(DEFAULT_AM_END_HOUR);
+  const pmEnd = ends ? Date.parse(ends.pmEnd) : at(DEFAULT_PM_END_HOUR);
+  const t = now.getTime();
+  if (t < amEnd) return { date: today, window: 'AM' };
+  if (t < pmEnd) return { date: today, window: 'PM' };
+  return { date: addDays(today, 1), window: 'AM' };
 }
+
+/** Sort key for a sit: later date, or same date and PM after AM, sorts higher. */
+export const sitOrder = (s: { date: string; window: 'AM' | 'PM' }): string => `${s.date}${s.window === 'AM' ? 0 : 1}`;
 
 export function addDays(date: string, n: number): string {
   const [y, m, d] = date.split('-').map(Number);

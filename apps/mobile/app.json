@@ -12,11 +12,14 @@
       "bundleIdentifier": "com.maturebuck.standplanner",
       "supportsTablet": false,
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Your location centers the map, fills the forecast for your hunting spot, and lets you drop sightings where you are. It never leaves your phone unless you share.",
+        "NSLocationWhenInUseUsageDescription": "Your location centers the map, fills the forecast for your hunting spot, adds your position to an emergency text you choose to send, and lets you drop sightings where you are. Forecast and terrain lookups send your property's coordinates to public US services (National Weather Service, USGS, MRLC, USDA cropland data); your plans and hunts stay on your phone unless you share them.",
         "NSPhotoLibraryUsageDescription": "Pick a map screenshot or aerial photo of your property to plan stands on.",
         "NSCameraUsageDescription": "Photograph a paper map of your property.",
         "NSMicrophoneUsageDescription": "Dictate your post-hunt notes.",
         "UIBackgroundModes": []
+      },
+      "entitlements": {
+        "com.apple.developer.usernotifications.time-sensitive": true
       }
     },
     "android": {
@@ -34,7 +37,7 @@
       "expo-router",
       "expo-secure-store",
       ["expo-sqlite", { "useSQLCipher": true }],
-      ["expo-location", { "locationWhenInUsePermission": "Your location centers the map and fills the forecast for your hunting spot." }],
+      ["expo-location", { "locationWhenInUsePermission": "Your location centers the map, fills the forecast for your hunting spot, adds your position to an emergency text you choose to send, and lets you drop sightings where you are. Forecast and terrain lookups send your property's coordinates to public US services (National Weather Service, USGS, MRLC, USDA cropland data); your plans and hunts stay on your phone unless you share them." }],
       ["expo-image-picker", { "photosPermission": "Pick a map screenshot or aerial photo of your property.", "cameraPermission": "Photograph a paper map of your property." }],
       ["expo-notifications", { "sounds": [] }],
       "@maplibre/maplibre-react-native"

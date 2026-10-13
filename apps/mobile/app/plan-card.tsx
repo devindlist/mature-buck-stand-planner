@@ -16,8 +16,26 @@ export default function PlanCardScreen() {
   const t = useTheme();
   const planState = useAppStore((s) => s.plan);
   const shareOptIn = useAppStore((s) => s.settings.shareOptIn);
+  const selectedStandId = useAppStore((s) => s.selectedStandId);
   if (!planState) return <Redirect href="/" />;
   const card = planState.card;
+  const plan = planState.plan;
+
+  // Hunt the stand the hunter picked on Results (else the #1), under the same go/no-go rules.
+  const huntable = [...plan.recommendations, ...(plan.backup ? [plan.backup] : []), ...(plan.yourStands ?? [])];
+  const target = huntable.find((r) => r.stand.id === selectedStandId) ?? huntable[0];
+  const noGoReasons = target ? [...new Set([plan.weatherDecision, target.decision].filter((d) => d.status === 'no_go').flatMap((d) => d.reasons))] : [];
+  const noGo = !!target && (plan.weatherDecision.status === 'no_go' || target.decision.status === 'no_go');
+  const startHunt = () => {
+    if (!target) return;
+    const go = () => router.push({ pathname: '/hunt', params: { standId: target.stand.id } });
+    if (!noGo) return go();
+    // Never override the hunter, but never let a no-go slip by unread either.
+    Alert.alert(`NO-GO at ${target.stand.name} today`, noGoReasons.join('\n') || 'Conditions make this sit a no-go.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'I understand, start anyway', style: 'destructive', onPress: go },
+    ]);
+  };
 
   const share = async () => {
     if (!shareOptIn) {
@@ -99,7 +117,13 @@ export default function PlanCardScreen() {
         <Disclaimer text={card.disclaimer} />
 
         <BigButton label={shareOptIn ? 'Share plan (text)' : 'Share (off in Settings)'} kind="secondary" onPress={share} />
-        <BigButton label="Start Hunt mode" onPress={() => router.push('/hunt')} />
+        <BigButton
+          label="Start Hunt mode"
+          kind={noGo ? 'danger' : 'primary'}
+          disabled={!target}
+          sublabel={target ? `${target.isBackup ? 'Backup' : (plan.yourStands ?? []).includes(target) ? 'Your stand' : `#${target.rank}`}: ${target.stand.name}${noGo ? ' · NO-GO today' : ''}` : 'No stand passed the plan'}
+          onPress={startHunt}
+        />
       </ScrollView>
     </Screen>
   );

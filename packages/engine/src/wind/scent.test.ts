@@ -103,3 +103,30 @@ test('slope from an elevation grid and from mapped features', () => {
   assert.equal(fs.downslopeBearingDeg, 180, 'ridge to the north → downhill is south');
   assert.equal(fs.source, 'features');
 });
+
+test('a missing 3DEP sample stays missing after the JSON cache round-trip (never 0 m)', () => {
+  // 21×21 grid, 60 m cells, gentle 2% slope falling to the south; one EPQS sample failed.
+  const cols = 21;
+  const rows = 21;
+  const values: number[] = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) values.push(250 + 0.02 * r * 60);
+  const hole = 10 * cols + 10;
+  values[hole] = NaN;
+  const origin = { x: -600, y: -600 };
+  const fresh = new GridTerrain(origin, 60, cols, rows, values);
+  const cached: Array<number | null> = JSON.parse(JSON.stringify(values));
+  assert.equal(cached[hole], null, 'JSON turns NaN into null');
+  const fromCache = new GridTerrain(origin, 60, cols, rows, cached);
+  const nearHole = { x: 20, y: 10 };
+  for (const t of [fresh, fromCache]) {
+    assert.equal(t.elevationAt({ x: 0, y: 0 }), undefined);
+    assert.equal(t.elevationAt(nearHole), undefined);
+    assert.equal(slopeFromTerrain(t, nearHole), null, 'falls back to mapped features instead of a fake cliff');
+    const away = slopeFromTerrain(t, { x: -300, y: -300 })!;
+    assert.ok(Math.abs(away.slopePct - 2) < 1e-6 && Math.abs(away.downslopeBearingDeg - 180) < 1e-6);
+    assert.ok(Math.abs(t.coverage() - 440 / 441) < 1e-9);
+  }
+  // Partial nulls in a grid never read as sea level, wherever they are.
+  const allNull = new GridTerrain(origin, 60, 2, 2, [null, 100, 100, 100]);
+  assert.equal(allNull.elevationAt({ x: -570, y: -570 }), undefined);
+});
