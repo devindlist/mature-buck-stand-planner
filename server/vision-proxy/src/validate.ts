@@ -6,11 +6,16 @@ export const MEDIA_TYPES = ['image/jpeg', 'image/png', 'image/webp'] as const;
 export type MediaType = (typeof MEDIA_TYPES)[number];
 
 /**
- * About 4.95 MB decoded, under the API's 5 MB per-image cap. The app sends JPEGs of at most 2576 px on
- * the long edge (Claude's high-resolution tier), typically 0.5–2 MB. Keep this equal to the engine's
- * MAX_VISION_BASE64_CHARS (packages/engine/src/vision/client.ts), which the app checks before sending.
+ * Largest base64 payload accepted: 5,000,000 characters. The API's per-image cap is 5 MB, and
+ * whether that is counted on the decoded bytes (about 6.67M base64 characters) or on the base64
+ * text itself is not something this code can confirm offline, so the cap is set conservatively
+ * to the stricter reading: under 5 MB either way (5M characters decode to 3.75 MB). The app sends
+ * JPEGs of at most 2576 px / 3.75 MP, typically 0.5-2 MB, so the cost is negligible, and an image
+ * over the cap is re-encoded once at lower quality by the app instead of failing at the API.
+ * Keep this equal to the engine's MAX_VISION_BASE64_CHARS (packages/engine/src/vision/client.ts),
+ * which the app checks before sending; validate.test.ts asserts they match.
  */
-export const MAX_IMAGE_BASE64_CHARS = 6_600_000;
+export const MAX_IMAGE_BASE64_CHARS = 5_000_000;
 
 export interface AnalyzeRequest {
   imageBase64: string;

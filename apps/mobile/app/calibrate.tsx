@@ -1,8 +1,7 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, ScrollView, Text, useWindowDimensions, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
 import * as ImagePicker from 'expo-image-picker';
-import * as FileSystem from 'expo-file-system';
 import {
   calibrationFromNorthAndScale,
   calibrationFromTwoPoints,
@@ -34,6 +33,9 @@ import { analyzePhoto } from '../src/services/vision';
 import { createLandDataProvider } from '../src/services/landdata';
 import { currentLocation } from '../src/services/device';
 import { saveProperty, setSetting } from '../src/db/repos';
+import { adoptPickedPhoto, discardUnsavedPhoto } from '../src/db/mapPhotos';
+import { deleteTemporaryPhotoCopies } from '../src/db/database';
+import { isCancelled, raceAbort } from '../src/services/cancel';
 import { todayLocal, uid } from '../src/utils/format';
 import { font, SPACE } from '../src/theme/theme';
 
@@ -59,6 +61,8 @@ interface Photo {
 }
 
 const msg = (e: unknown, fallback = 'Unknown error') => (e instanceof Error ? e.message : fallback);
+
+const fmtElapsed = (ms: number) => `${Math.floor(ms / 60_000)}:${String(Math.floor(ms / 1000) % 60).padStart(2, '0')}`;
 
 /** Mock detections are a made-up farm: say so on every feature, everywhere it is shown. */
 function markSample(features: MapFeature[]): MapFeature[] {
@@ -121,23 +125,59 @@ export default function Calibrate() {
   const [lonText, setLonText] = useState('');
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState('');
+  /** When the wait for the vision proxy began (null when not waiting): drives the elapsed-time line. */
+  const [waitStart, setWaitStart] = useState<number | null>(null);
+  const [, setWaitTick] = useState(0);
+  /** True while an analysis can still be cancelled (waiting for the proxy, or cross-checking). */
+  const [analyzing, setAnalyzing] = useState(false);
+  /** The analysis in flight, so Cancel (or leaving the screen) can stop waiting for it. */
+  const runRef = useRef<{ cancelled: boolean; controller: AbortController } | null>(null);
+  const savingRef = useRef(false);
+  /** The picked photo, and whether a property now owns it (an unsaved one is deleted when the screen closes). */
+  const photoRef = useRef<Photo | null>(null);
+  photoRef.current = photo;
+  const savedRef = useRef(false);
+
+  useEffect(() => {
+    if (waitStart === null) return;
+    const id = setInterval(() => setWaitTick((n) => n + 1), 5_000);
+    return () => clearInterval(id);
+  }, [waitStart]);
+
+  useEffect(
+    () => () => {
+      const run = runRef.current;
+      if (run) {
+        run.cancelled = true;
+        run.controller.abort();
+      }
+      const p = photoRef.current;
+      if (p && !savedRef.current && !anchor) void discardUnsavedPhoto(p.uri);
+      void deleteTemporaryPhotoCopies();
+    },
+    [],
+  );
 
   const mapW = screenW - SPACE * 2;
   const mapH = screenH * 0.42;
   const mock = settings.visionMode === 'mock';
 
   const pickPhoto = async (camera: boolean) => {
-    const perm = camera ? await ImagePicker.requestCameraPermissionsAsync() : await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (!perm.granted) return Alert.alert('Permission needed', camera ? 'Allow camera access to photograph a map.' : 'Allow photo access to pick a map screenshot.');
-    const r = camera ? await ImagePicker.launchCameraAsync({ quality: 0.9 }) : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.9 });
-    if (r.canceled || !r.assets[0]) return;
-    const a = r.assets[0];
-    // Keep the photo inside the app sandbox (it never leaves the phone).
-    const dir = `${FileSystem.documentDirectory}maps/`;
-    await FileSystem.makeDirectoryAsync(dir, { intermediates: true }).catch(() => undefined);
-    const dest = `${dir}${uid('map')}.jpg`;
-    await FileSystem.copyAsync({ from: a.uri, to: dest });
-    setPhoto({ uri: dest, width: a.width, height: a.height });
+    try {
+      const perm = camera ? await ImagePicker.requestCameraPermissionsAsync() : await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (!perm.granted) return Alert.alert('Permission needed', camera ? 'Allow camera access to photograph a map.' : 'Allow photo access to pick a map screenshot.');
+      const r = camera ? await ImagePicker.launchCameraAsync({ quality: 0.9 }) : await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], quality: 0.9 });
+      if (r.canceled || !r.assets[0]) return;
+      const a = r.assets[0];
+      // Keep the photo inside the app (it never leaves the phone). The picker's temporary
+      // copy is moved, not left behind; saving the map stores the photo in the encrypted database.
+      const dest = await adoptPickedPhoto(a.uri, `${uid('map')}.jpg`);
+      const previous = photoRef.current;
+      setPhoto({ uri: dest, width: a.width, height: a.height });
+      if (previous && !anchorBase) void discardUnsavedPhoto(previous.uri);
+    } catch (e) {
+      Alert.alert('Could not use that photo', msg(e));
+    }
   };
 
   const metersPerPixel = useMemo(() => {
@@ -250,6 +290,7 @@ export default function Calibrate() {
       updatedAt: now,
     };
     const saved = await saveProperty(property);
+    savedRef.current = true;
     upsertProperty(saved);
     set({ activePropertyId: saved.id });
     await setSetting('activePropertyId', saved.id);
@@ -258,28 +299,57 @@ export default function Calibrate() {
 
   /** No analysis: keep the calibration, start with an empty map the hunter fills in. */
   const mapByHand = async () => {
-    if (!photo || !calibration) return;
+    if (!photo || !calibration || savingRef.current || runRef.current) return;
+    savingRef.current = true;
     setBusy(true);
     try {
       await saveNewProperty(uid('prop'), [], 'manual');
     } catch (e) {
       Alert.alert('Could not save the map', msg(e));
     } finally {
+      savingRef.current = false;
       setBusy(false);
     }
   };
 
+  /** Stop waiting for the analysis. The calibration and photo are kept; nothing is saved. */
+  const cancelAnalysis = () => {
+    const run = runRef.current;
+    if (!run) return;
+    run.cancelled = true;
+    run.controller.abort();
+    runRef.current = null;
+    setBusy(false);
+    setAnalyzing(false);
+    setWaitStart(null);
+    setProgress('Cancelled. Your calibration is kept: try again, or mark features by hand.');
+  };
+
   const analyzeAndSave = async () => {
-    if (!photo || !calibration) return;
+    if (!photo || !calibration || runRef.current || savingRef.current) return;
+    const run = { cancelled: false, controller: new AbortController() };
+    runRef.current = run;
     setBusy(true);
+    setAnalyzing(true);
     const id = uid('prop');
+    /** Back to idle, unless Cancel (or a newer run) already took over the screen. */
+    const finish = () => {
+      if (runRef.current !== run) return;
+      runRef.current = null;
+      setBusy(false);
+      setAnalyzing(false);
+      setWaitStart(null);
+      setProgress('');
+    };
     let v: VisionResponse;
     try {
-      setProgress(mock ? 'Loading sample features…' : 'Analyzing map photo…');
-      v = await analyzePhoto(photo.uri, photo.width, photo.height, settings);
+      setProgress(mock ? 'Loading sample features…' : 'Analyzing map photo… this can take a few minutes. Keep the app open.');
+      if (!mock) setWaitStart(Date.now());
+      v = await raceAbort(analyzePhoto(photo.uri, photo.width, photo.height, settings), run.controller.signal);
     } catch (e) {
-      setBusy(false);
-      setProgress('');
+      if (run.cancelled || isCancelled(e)) return;
+      finish();
+      void deleteTemporaryPhotoCopies();
       Alert.alert('Analysis failed', `${msg(e)}\n\nYour calibration is kept. Save the map and mark features by hand, or try again.`, [
         { text: 'Cancel', style: 'cancel' },
         { text: 'Try again', onPress: () => void analyzeAndSave() },
@@ -287,16 +357,29 @@ export default function Calibrate() {
       ]);
       return;
     }
+    void deleteTemporaryPhotoCopies(); // the downsized copy made for the upload
+    setWaitStart(null);
     try {
+      if (run.cancelled) return;
       const sample = v.mode === 'mock';
       let features = visionToFeatures(v.result, calibration, id);
       if (sample) {
         features = markSample(features);
       } else if (calibration.originGeo) {
         setProgress('Cross-checking with USGS elevation and land cover…');
-        features = await crossCheckFeatures(features, calibration, createLandDataProvider(), todayLocal()).catch(() => features);
+        features = await raceAbort(
+          crossCheckFeatures(features, calibration, createLandDataProvider(), todayLocal()).catch(() => features),
+          run.controller.signal,
+        );
       }
-      await saveNewProperty(id, features, sample ? 'mock' : 'proxy');
+      if (run.cancelled) return;
+      setAnalyzing(false); // saving takes a moment and is not cancelled half way
+      savingRef.current = true;
+      try {
+        await saveNewProperty(id, features, sample ? 'mock' : 'proxy');
+      } finally {
+        savingRef.current = false;
+      }
       if (sample) {
         Alert.alert('Sample features loaded', 'These are a made-up Midwest farm, not detections from your photo. Each one is labelled "Sample". Dismiss or replace them before you trust a plan.');
       } else {
@@ -304,10 +387,9 @@ export default function Calibrate() {
         if (notes.length) Alert.alert('Analysis notes', notes.slice(0, 5).join('\n\n'));
       }
     } catch (e) {
-      Alert.alert('Could not save the map', msg(e));
+      if (!run.cancelled && !isCancelled(e)) Alert.alert('Could not save the map', msg(e));
     } finally {
-      setBusy(false);
-      setProgress('');
+      finish();
     }
   };
 
@@ -500,7 +582,9 @@ export default function Calibrate() {
                 <BigButton label="Skip: mark features by hand" kind="ghost" disabled={busy} onPress={mapByHand} />
               </>
             )}
-            {progress ? <Text style={{ color: t.accent, marginTop: 8 }}>{progress}</Text> : null}
+            {progress ? <Text style={{ color: t.accent, marginTop: 8 }} accessibilityLiveRegion="polite">{progress}</Text> : null}
+            {waitStart !== null ? <Text style={{ color: t.textDim, fontSize: font.sm }}>Waiting {fmtElapsed(Date.now() - waitStart)}. Safe to wait: nothing is saved until the analysis comes back.</Text> : null}
+            {analyzing && !mock ? <BigButton label="Cancel analysis" kind="secondary" onPress={cancelAnalysis} /> : null}
             <BigButton label="Back" kind="ghost" disabled={busy} onPress={() => setStep('refs')} />
           </>
         ) : null}

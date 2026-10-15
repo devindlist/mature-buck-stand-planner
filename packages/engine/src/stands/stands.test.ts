@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { generateCandidates, standOffsetM, ON_TRAIL_M } from './candidates.ts';
-import { createRoutePlanner, astar, buildCostGrid, makeSegmentJudge, type RouteContext } from './routes.ts';
+import { createRoutePlanner, astar, buildCostGrid, findSharedAccessHazards, makeSegmentJudge, type RouteContext, type RoutePair } from './routes.ts';
 import { inferHabitat, distanceToArea, BEDDING_MIN_PROB } from '../inference/habitat.ts';
 import { at, fixtureProperty, userFeature } from '../test/fixtures.ts';
 import { BEDDING_SETBACK_M } from '../season/phase.ts';
@@ -9,7 +9,7 @@ import { bearingVec, dist, dot, downwindBearing, pointInPolygon, pointPolylineDi
 import { scoreAccess, scoreBeddingDistance, scorePressure, scoreShot, scoreWeatherTime, scoreWindFit, standContext, WEIGHTS } from './scoring.ts';
 import type { AccessConstraint, HabitatSummary, MapFeature, PressureEvent, Property, Stand, Vec } from '../models.ts';
 import { weather } from '../test/fixtures.ts';
-import { moonModifier, pressureModifier, combinedModifierPoints, OBSERVED_DATA_DAMPING } from '../modifiers/modifiers.ts';
+import { cloudCoverModifier, moonModifier, pressureModifier, combinedModifierPoints, MAX_MODIFIER_POINTS, OBSERVED_DATA_DAMPING } from '../modifiers/modifiers.ts';
 
 const ctxFor = (windFromDeg: number) => ({ phase: 'pre_rut' as const, window: 'PM' as const, windFromDeg, effectiveRangeYds: 35, setbackM: BEDDING_SETBACK_M.pre_rut });
 
@@ -157,6 +157,30 @@ test('moon and pressure are low-confidence, capped, and damped by observed data'
   assert.ok(c.reasons.some((r) => r.includes('outranks')));
 });
 
+test('cloud cover is a small low-confidence modifier that shares the same cap and damping', () => {
+  assert.equal(cloudCoverModifier(weather({ cloudCoverPct: undefined }), 'PM'), null, 'unknown cloud cover is not a modifier');
+  const overcastPm = cloudCoverModifier(weather({ cloudCoverPct: 90 }), 'PM')!;
+  const overcastAm = cloudCoverModifier(weather({ cloudCoverPct: 90 }), 'AM')!;
+  const partly = cloudCoverModifier(weather({ cloudCoverPct: 40 }), 'PM')!;
+  for (const m of [overcastPm, overcastAm, partly]) assert.deepEqual([m.key, m.tag], ['cloud_cover', 'low_confidence']);
+  assert.ok(overcastPm.points > 0 && overcastPm.points <= 0.3 && overcastAm.points > 0 && overcastAm.points <= 0.3);
+  assert.equal(partly.points, 0);
+  assert.ok(/Overcast \(90% cloud\)/.test(overcastPm.detail));
+  // Everything together still obeys the one ±0.75 cap, and observed data still damps it.
+  const m = moonModifier(new Date('2024-04-23T23:49:00Z'), 'AM');
+  const p = pressureModifier(weather({ pressureTrend: 'rising', pressureChange3hHpa: 3 }));
+  assert.ok(m.points + p.points + overcastAm.points > MAX_MODIFIER_POINTS, 'the raw sum exceeds the cap');
+  assert.equal(combinedModifierPoints([m, p, overcastAm], false), MAX_MODIFIER_POINTS);
+  assert.equal(combinedModifierPoints([m, p, overcastAm], true), MAX_MODIFIER_POINTS * OBSERVED_DATA_DAMPING);
+  // And it moves the weather & time fit when the cap isn't already reached.
+  const habitat = inferHabitat(fixtureProperty().features, [], { phase: 'pre_rut', window: 'PM', windFromDeg: 315 });
+  const ctx = standContext(at(0.6, 0.45), habitat, 35);
+  const w = weather({ tempF: 52, pressureTrend: 'steady' });
+  const fit = (mods: Parameters<typeof scoreWeatherTime>[5]) => scoreWeatherTime(w, '2026-11-07', 'PM', 'pre_rut', ctx, mods, false);
+  assert.ok(fit([overcastPm]).value > fit([partly]).value);
+  assert.ok(fit([overcastPm]).tags.includes('low_confidence'));
+});
+
 test('dist helper sanity for fixtures', () => {
   assert.ok(Math.abs(dist(at(0, 0.5), at(1, 0.5)) - 1400) < 1e-6);
 });
@@ -225,10 +249,18 @@ test('a stand inside a no-access zone, or cut off by water, is unreachable (not 
   const edge = createRoutePlanner(routeCtx(p)).plan({ x: 505, y: 600 });
   assert.equal(edge.unreachable, true);
 
-  const moat = square([access, userFeature('w', 'water', rect(-50, 300, 850, 360), 'polygon')]);
+  // Water on every side (an island): no walk exists even through a neighbor's ground.
+  const island = [rect(320, 740, 480, 780), rect(320, 620, 480, 660), rect(320, 620, 360, 780), rect(440, 620, 480, 780)];
+  const moat = square([access, ...island.map((r, i) => userFeature(`w${i}`, 'water', r, 'polygon'))]);
   const cutOff = createRoutePlanner(routeCtx(moat)).plan({ x: 400, y: 700 });
   assert.equal(cutOff.unreachable, true);
   assert.equal(cutOff.noAccess, false);
+  // A river that runs off the property is NOT unreachable: the way round is over ground off the
+  // property line, which is flagged (never a false "no legal route"), not forbidden.
+  const river = square([access, userFeature('w', 'water', rect(-50, 300, 850, 360), 'polygon')]);
+  const detour = createRoutePlanner(routeCtx(river)).plan({ x: 400, y: 700 });
+  assert.equal(detour.unreachable, false);
+  assert.equal(detour.softCrossing, true);
   const none = createRoutePlanner(routeCtx({ ...square([]), boundary: undefined })).plan({ x: 400, y: 700 });
   assert.deepEqual([none.noAccess, none.unreachable], [true, false]);
 });
@@ -239,7 +271,18 @@ test('routes never cut across a no-access zone: no diagonal leaks, no corner cut
   const d = 8 * Math.SQRT1_2;
   const strip = zone('lane', [{ x: -100 - d, y: 900 - d }, { x: 900 - d, y: -100 - d }, { x: 900 + d, y: -100 + d }, { x: -100 + d, y: 900 + d }]);
   const sep = createRoutePlanner(routeCtx(square([access], [strip]))).plan({ x: 600, y: 600 });
-  assert.equal(sep.unreachable, true, 'no route through the strip');
+  // The lane runs off both ends of the property, so the only way round is over ground off the
+  // property line: flagged red, never through the lane.
+  assert.equal(sep.unreachable, false);
+  assert.equal(sep.softCrossing, true, 'the detour leaves the property');
+  assert.ok(sep.entry && sep.exit);
+  for (const r of [sep.entry, sep.exit]) {
+    assert.ok(r.points.every((q) => !pointInPolygon(q, strip.geometry.points)), `${r.kind} enters the lane`);
+    assert.equal(crosses(r.points, strip.geometry.points), false, `${r.kind} cuts across the lane`);
+  }
+  // A lane that closes the stand in on every side leaves no route at all.
+  const pen = square([access], [zone('pen', rect(540, 540, 660, 660), 'neighbor_line', 'polygon')]);
+  assert.equal(createRoutePlanner(routeCtx(pen)).plan({ x: 600, y: 600 }).unreachable, true, 'fenced pen with no gate');
 
   // A block the route has to walk around: no route point inside, no segment through it.
   const block = rect(250, 150, 550, 550);
@@ -256,7 +299,15 @@ test('neighbor lines block routes; a must-use gate is where the route crosses', 
   const fence = zone('n', [{ x: -20, y: 400 }, { x: 820, y: 400 }], 'neighbor_line', 'line');
   const stand = { x: 600, y: 700 };
   const blocked = createRoutePlanner(routeCtx(square([access], [fence]))).plan(stand);
-  assert.equal(blocked.unreachable, true, 'fence line with no gate');
+  // The fence only runs 20 m past the property line, so with no gate the only way round is over
+  // ground off the property line: flagged, never across the fence.
+  assert.equal(blocked.unreachable, false);
+  assert.equal(blocked.softCrossing, true, 'detour around the fence end leaves the property');
+  assert.ok(blocked.entry && blocked.entry.segments.some((x) => x.ground === 'off_property' && x.status === 'avoid'));
+  assert.equal(crosses(blocked.entry.points, fence.geometry.points), false, 'never across the fence');
+  // A fence that fully encloses the stand, with no gate, leaves no route.
+  const enclosed = zone('pen', rect(500, 600, 700, 800), 'neighbor_line', 'polygon');
+  assert.equal(createRoutePlanner(routeCtx(square([access], [enclosed]))).plan({ x: 600, y: 700 }).unreachable, true, 'fenced pen with no gate');
 
   const gate = zone('g', [{ x: 100, y: 400 }], 'must_use_gate', 'point');
   const viaGate = createRoutePlanner(routeCtx(square([access], [fence, gate]))).plan(stand);
@@ -381,4 +432,98 @@ test('bedding distance checks the bed whose setback the stand presses hardest, n
   // Far from both: the closer-to-setback bed is still the one reported.
   const far = standContext({ x: 0, y: 600 }, habitat, 35);
   assert.ok(far.nearestBedding);
+});
+
+// --- Soft blocks (off-property ground, house buffers) never make a stand unreachable ------
+
+const flags = (r: { segments: Array<{ status: string; ground?: string }> } | null) => r?.segments.map((x) => `${x.status}${x.ground ? `:${x.ground}` : ''}`) ?? [];
+
+test('A* with soft ground relaxed finds the walk the strict pass cannot (hard blocks still stop it)', () => {
+  const p = square([userFeature('a', 'access_point', [{ x: 400, y: -250 }], 'point')]);
+  const grid = buildCostGrid(routeCtx(p), 'entry');
+  assert.equal(astar(grid, { x: 400, y: -250 }, { x: 600, y: 600 }), null, 'strict: 250 m of soft ground in the way');
+  const relaxed = astar(grid, { x: 400, y: -250 }, { x: 600, y: 600 }, undefined, true);
+  assert.ok(relaxed && relaxed.path.length > 2);
+  // Relaxing soft ground never opens a hard block.
+  const walled = buildCostGrid(routeCtx(square([userFeature('a', 'access_point', [{ x: 400, y: 20 }], 'point')], [zone('pen', rect(540, 640, 660, 760), 'neighbor_line', 'polygon')])), 'entry');
+  assert.equal(astar(walled, { x: 400, y: 20 }, { x: 600, y: 700 }, undefined, true), null, 'a closed fence ring is a hard block');
+});
+
+test('a parking spot far outside the property line is a flagged route, not a false "no legal route"', () => {
+  // Up to ~100 m out the truck is just on the road shoulder: nothing is flagged.
+  const shoulder = createRoutePlanner(routeCtx(square([userFeature('a', 'access_point', [{ x: 400, y: -90 }], 'point')]))).plan({ x: 600, y: 600 });
+  assert.equal(shoulder.softCrossing, false);
+  assert.ok(!flags(shoulder.entry).some((x) => /off_property/.test(x)));
+  for (const off of [150, 250, 600]) {
+    const r = createRoutePlanner(routeCtx(square([userFeature('a', 'access_point', [{ x: 400, y: -off }], 'point', { label: 'Truck' })]))).plan({ x: 600, y: 600 });
+    assert.equal(r.unreachable, false, `${off} m out is not unreachable`);
+    assert.equal(r.noAccess, false);
+    assert.equal(r.softCrossing, true, `${off} m out`);
+    assert.ok(r.entry && r.exit, `${off} m out: both walks exist`);
+    for (const route of [r.entry, r.exit]) {
+      const off_ = route.segments.filter((x) => x.ground === 'off_property');
+      assert.ok(off_.length > 0, `${route.kind} ${off} m out has flagged stretches`);
+      assert.ok(off_.every((x) => x.status === 'avoid' && /permission/.test(x.reason) && /access point/.test(x.reason)));
+      assert.ok(route.notes.some((n) => /off your property/.test(n)));
+      // The first stretch by the truck is not flagged, and the walk ends inside the property.
+      const first = route.kind === 'entry' ? route.segments[0] : route.segments[route.segments.length - 1];
+      assert.equal(first.ground, undefined, 'the stretch by the truck is tolerated');
+    }
+  }
+});
+
+test('an inferred road start far outside the line gives a flagged route too', () => {
+  const road = userFeature('r', 'road', [{ x: -200, y: -300 }, { x: 1000, y: -300 }], 'line');
+  const r = createRoutePlanner(routeCtx(square([road]))).plan({ x: 500, y: 500 });
+  assert.equal(r.unreachable, false);
+  assert.equal(r.softCrossing, true);
+  assert.ok(r.entry && r.entry.notes.some((n) => /inferred/.test(n)));
+  assert.ok(flags(r.entry).includes('avoid:off_property'));
+});
+
+test('a farmhouse in the only gap is crossed at a high cost and flagged, not a wall', () => {
+  const house = userFeature('h', 'house', [{ x: 50, y: 400 }], 'point');
+  const neck = fixtureProperty({
+    boundary: [{ x: 20, y: 0 }, { x: 80, y: 0 }, { x: 80, y: 800 }, { x: 20, y: 800 }],
+    features: [house, userFeature('a', 'access_point', [{ x: 50, y: 10 }], 'point', { label: 'Road' })],
+  });
+  const r = createRoutePlanner(routeCtx(neck)).plan({ x: 50, y: 700 });
+  assert.equal(r.unreachable, false);
+  assert.equal(r.softCrossing, true);
+  assert.ok(r.entry && flags(r.entry).includes('avoid:house_buffer'));
+  assert.ok(r.entry.segments.find((x) => x.ground === 'house_buffer')?.reason.startsWith('Within 50 m of a house'));
+  assert.ok(r.entry.notes.some((n) => /within 50 m of a house/.test(n)));
+  assert.ok(r.exit && flags(r.exit).includes('avoid:house_buffer'));
+  // With room to walk around the house, nothing is flagged.
+  const wide = createRoutePlanner(routeCtx(square([house, userFeature('a', 'access_point', [{ x: 400, y: 10 }], 'point')]))).plan({ x: 600, y: 700 });
+  assert.equal(wide.softCrossing, false);
+});
+
+// --- A scent problem at the parking spot is found once, across stands ------------------------
+
+const hazardRoute = (kind: 'entry' | 'exit', atAccess: boolean, label = 'Field gate'): NonNullable<RoutePair['entry']> => ({
+  kind,
+  startLabel: label,
+  points: kind === 'entry' ? [{ x: 0, y: 0 }, { x: 100, y: 0 }] : [{ x: 100, y: 0 }, { x: 0, y: 0 }],
+  segments: [{ points: [{ x: 0, y: 0 }, { x: 100, y: 0 }], status: atAccess ? 'avoid' : 'safe', reason: atAccess ? 'Wind carries your scent onto feeding deer.' : 'Clear of bedding, food and travel.', ...(atAccess ? { atAccess: true } : {}) }],
+  lengthM: 100,
+  minDistToBeddingM: -1,
+  notes: [],
+  worstStatus: atAccess ? 'avoid' : 'safe',
+});
+const pair = (atAccess: boolean): RoutePair => ({ entry: hazardRoute('entry', atAccess), exit: hazardRoute('exit', atAccess), noAccess: false, unreachable: false, softCrossing: false });
+
+test('a parking-spot scent problem is shared only when most stands starting there hit it', () => {
+  const most = [pair(true), pair(true), pair(true), pair(false)];
+  const { hazards, shared } = findSharedAccessHazards(most);
+  assert.equal(hazards.length, 1);
+  assert.equal(hazards[0].label, 'Field gate');
+  assert.deepEqual([...hazards[0].walks].sort(), ['entry', 'exit']);
+  assert.deepEqual(hazards[0].targets, ['food']);
+  assert.deepEqual(shared.get(most[0]), { entry: true, exit: true });
+  assert.equal(shared.get(most[3]), undefined, 'a stand that does not hit it is not discounted');
+  // One stand's problem is that stand's problem.
+  assert.equal(findSharedAccessHazards([pair(true), pair(false), pair(false)]).hazards.length, 0);
+  assert.equal(findSharedAccessHazards([pair(true)]).hazards.length, 0, 'a single stand is never "shared"');
+  assert.equal(findSharedAccessHazards([pair(false), pair(false)]).hazards.length, 0);
 });

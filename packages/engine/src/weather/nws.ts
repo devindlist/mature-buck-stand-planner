@@ -294,8 +294,19 @@ async function getJson(url: string, opts: NwsClientOptions): Promise<unknown> {
   });
 }
 
+/**
+ * The /points lookup is the only place the hunter's location leaves the phone for NWS, and its
+ * grid cells are 2.5 km wide, so 3 decimals (about 100 m) loses nothing the forecast uses while
+ * not handing the weather service the exact stand-area position.
+ */
+export const NWS_POINT_DECIMALS = 3;
+
+export function pointsUrl(loc: LatLon): string {
+  return `${NWS_BASE}/points/${loc.lat.toFixed(NWS_POINT_DECIMALS)},${loc.lon.toFixed(NWS_POINT_DECIMALS)}`;
+}
+
 export async function fetchSnapshot(loc: LatLon, windowStartIso: string, windowEndIso: string, opts: NwsClientOptions): Promise<{ snapshot: WeatherSnapshot; point: NwsPoint }> {
-  const point = parsePoint(await getJson(`${NWS_BASE}/points/${loc.lat.toFixed(4)},${loc.lon.toFixed(4)}`, opts));
+  const point = parsePoint(await getJson(pointsUrl(loc), opts));
   const [hourlyBody, gridBody, stationsBody] = await Promise.all([
     getJson(point.forecastHourlyUrl, opts),
     getJson(point.gridDataUrl, opts).catch(() => null),

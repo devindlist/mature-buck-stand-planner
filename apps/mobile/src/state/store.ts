@@ -14,7 +14,15 @@ export interface Settings {
   defaultWeapon: WeaponType;
   defaultRangeYds: number;
   checkInMinutes: number;
+  /** Shooting is legal this many minutes before sunrise / after sunset (many Midwest states: 30/30; check your state's rules). */
+  legalMinutesBefore: number;
+  legalMinutesAfter: number;
 }
+
+/** Range of the legal-hours offsets the hunter can set in Settings (minutes). */
+export const LEGAL_MINUTES_MIN = 0;
+export const LEGAL_MINUTES_MAX = 60;
+export const LEGAL_MINUTES_DEFAULT = 30;
 
 /** A sensible starting range for each weapon. A saved default range is always paired with its weapon. */
 export const DEFAULT_RANGE_YDS: Record<WeaponType, number> = { bow: 30, crossbow: 40, muzzleloader: 125, shotgun: 100, rifle: 250, handgun: 100 };
@@ -36,7 +44,20 @@ export const DEFAULT_SETTINGS: Settings = {
   defaultWeapon: 'bow',
   defaultRangeYds: 30,
   checkInMinutes: 240,
+  legalMinutesBefore: LEGAL_MINUTES_DEFAULT,
+  legalMinutesAfter: LEGAL_MINUTES_DEFAULT,
 };
+
+const legalMinutes = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? Math.min(LEGAL_MINUTES_MAX, Math.max(LEGAL_MINUTES_MIN, Math.round(v))) : LEGAL_MINUTES_DEFAULT);
+
+/**
+ * Settings read back from storage: missing fields (an older version) get their defaults,
+ * and the legal-hours offsets are kept inside what Settings lets the hunter pick.
+ */
+export function normalizeSettings(saved: unknown): Settings {
+  const merged: Settings = { ...DEFAULT_SETTINGS, ...(saved && typeof saved === 'object' ? (saved as Partial<Settings>) : {}) };
+  return { ...merged, legalMinutesBefore: legalMinutes(merged.legalMinutesBefore), legalMinutesAfter: legalMinutes(merged.legalMinutesAfter) };
+}
 
 export interface PlanDraft {
   date: ISODate;

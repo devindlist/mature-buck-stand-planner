@@ -21,6 +21,18 @@ import { isAndroid, isIOS } from './platform';
  *
  * Arming never fails silently: armCheckIn reports whether anything was scheduled and why
  * not, and Hunt mode shows a red banner when no reminder will fire.
+ *
+ * Platform requirements that cannot be checked from JavaScript:
+ *  - Android 12+ delays reminders unless "Alarms & reminders" is allowed for the app.
+ *    SCHEDULE_EXACT_ALARM is declared once in app.json; whether the hunter has granted it
+ *    cannot be read without a native module, so Settings and Hunt mode show a standing
+ *    note and an "Open app settings" button instead of guessing.
+ *  - iOS 'timeSensitive' alerts (below) need the com.apple.developer.usernotifications.
+ *    time-sensitive entitlement in app.json. They let the pre-dawn check-in through a Sleep
+ *    or Do Not Disturb Focus, which is the point of a safety reminder. Without the
+ *    entitlement iOS still delivers the alert as a normal one; the only cost is that a
+ *    build signed with a free Apple "Personal Team" may refuse to provision: for such a
+ *    local build remove that entitlement from app.json (the reminders still fire).
  */
 export const OVERDUE_GRACE_MIN = 30;
 export const CHECKIN_CHANNEL_ID = 'checkin';

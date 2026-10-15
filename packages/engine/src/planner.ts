@@ -12,6 +12,7 @@ import type {
   PressureEvent,
   Property,
   Risk,
+  Route,
   ScoreComponent,
   Sighting,
   SitWindow,
@@ -26,10 +27,10 @@ import type {
 } from './models.ts';
 import { angleDiff, bearingTo, circlePolygon, compass16, dist, downwindBearing, mToYds, normDeg, pointGeometryDistance, slicePolyline, polylineLength, projectOntoPolyline, round, ydsToM } from './geo/geometry.ts';
 import { derivePhase, AM_HOLD_MIN, BEDDING_SETBACK_M, PM_SETTLE_MIN, PHASE_TACTICS } from './season/phase.ts';
-import { addMinutes, legalHours, sunTimes } from './astro/sun.ts';
-import { BEDDING_MIN_PROB, inferHabitat } from './inference/habitat.ts';
+import { addMinutes, legalHoursFor, sunTimes } from './astro/sun.ts';
+import { BEDDING_MIN_PROB, FOOD_SENSITIVE_MIN, inferHabitat } from './inference/habitat.ts';
 import { generateCandidates, type Candidate, effectiveSetback } from './stands/candidates.ts';
-import { createRoutePlanner, type RoutePair, type RoutePlanner } from './stands/routes.ts';
+import { createRoutePlanner, findSharedAccessHazards, type AccessHazard, type RoutePair, type RoutePlanner, type SharedAccess } from './stands/routes.ts';
 import { directionSpread, evaluateGate, LIGHT_WIND_MPH, scentModel, windMargin, type GateResult, type PlumeHit, type ScentModel, type SensitiveArea, type WindState } from './wind/scent.ts';
 import { slopeAt, type SlopeInfo, type TerrainModel } from './terrain/terrain.ts';
 import {
@@ -47,14 +48,13 @@ import {
   type StandContext,
 } from './stands/scoring.ts';
 import { assessWeather, DISCLAIMER, HARNESS_REMINDER, laneFor, planReminders, shotLanes, weaponSafetyReminders } from './safety/safety.ts';
-import { moonModifier, pressureModifier } from './modifiers/modifiers.ts';
+import { cloudCoverModifier, moonModifier, pressureModifier } from './modifiers/modifiers.ts';
 
 export const ENGINE_VERSION = '0.1.0';
 export const MIN_PICK_SPACING_M = 100;
-/** Food at least this likely to be fed in this sit is a hard wind-gate area. */
-export const FOOD_SENSITIVE_MIN = 0.3;
 /**
- * Food the engine keeps (and builds travel toward) but that is less likely to be fed:
+ * Food the engine keeps (and builds travel toward) but that is less likely to be fed than
+ * FOOD_SENSITIVE_MIN (inference/habitat.ts; the hard wind-gate floor, shared with the route judge):
  * scent drifting into it is a caution and a wind-fit penalty, not an elimination.
  */
 export const FOOD_SOFT_MIN = 0.15;
@@ -62,8 +62,10 @@ export const FOOD_SOFT_MIN = 0.15;
 export const MIN_BACKUP_EXTRA_SECTORS = 2;
 /** A forecast hour at least one compass sector off today's wind is a forecast shift (NWS gives 16-point directions). */
 export const FORECAST_SHIFT_DEG = 22.5;
-/** Risk text for a stand no legal route reaches (the plan card keys off it). */
-export const UNREACHABLE_RISK = 'No legal walking route from your access points. A no-access zone, water or the boundary blocks every path in.';
+/** Risk text for a stand no legal route reaches (the plan card keys off it). Only hard blocks cause it. */
+export const UNREACHABLE_RISK = 'No legal walking route from your access points. A no-access zone, water or a neighbor line blocks every path in.';
+/** Risk text for a stand whose only walk crosses ground off the property line or beside a house. */
+export const SOFT_CROSSING_RISK = 'Walk crosses ground off your property: get permission or mark a different access point.';
 
 export interface PlanRequest {
   property: Property;
@@ -80,7 +82,7 @@ export interface PlanRequest {
 // ---------------------------------------------------------------------------
 
 export function sitWindow(inputs: PlanInputs, phase: Plan['phase']['phase'], sun: SunTimes): SitWindow {
-  const legal = legalHours(sun);
+  const legal = legalHoursFor(sun, inputs);
   if (inputs.window === 'AM') {
     const hold = AM_HOLD_MIN[phase];
     const allDay = phase === 'seeking_chasing' || phase === 'lockdown';
@@ -173,6 +175,19 @@ export function approachPaths(ctx: StandContext, window: PlanInputs['window']): 
     if (shape.length >= 2) out.push({ id: `approach-${corridor.id}`, kind: 'approach', label: 'the approach trail', shape, closed: false, hardRangeM: 400 });
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Plan-level route warnings
+// ---------------------------------------------------------------------------
+
+const NOT_SHARED: SharedAccess = { entry: false, exit: false };
+
+/** One warning for a parking spot that puts scent on deer for most stands: actionable, and said once. */
+export function accessHazardWarning(h: AccessHazard): string {
+  const what = h.targets.includes('food') && h.targets.includes('bedding') ? 'the field and bedding' : h.targets.includes('food') ? 'the field' : 'bedding';
+  const walk = h.walks.length === 2 ? 'in and out' : h.walks[0] === 'entry' ? 'walking in' : 'walking out';
+  return `Your parking spot (${h.label}) is upwind of ${what} in today's wind, so the stretch by the truck (${walk}) carries your scent onto deer. It is the same for the ${h.stands} stands that start there, so it is not counted against any one of them. Park somewhere else, approach from the other side, or mark another access point.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +361,8 @@ interface Scored {
   /** The wind this stand was scored for (today's, or the assumed wind of a wind-shift backup). */
   ws: WindState;
   routes: RoutePair;
+  /** Which walks have a scent problem at the parking spot that the plan reports once, for every stand. */
+  shared: SharedAccess;
   components: ScoreComponent[];
   total: number;
   margin: number;
@@ -372,6 +389,7 @@ function risksFor(s: Scored, req: PlanRequest, setbackM: number): Risk[] {
   const p = s.e.candidate.stand.position;
   const { inputs } = req;
   if (s.routes.unreachable) risks.push({ severity: 3, text: UNREACHABLE_RISK });
+  if (s.routes.softCrossing) risks.push({ severity: 3, text: SOFT_CROSSING_RISK });
   if (s.shiftFailures.length) {
     risks.push({ severity: 3, text: `Forecast swings to ${compass16(s.shiftFailures[0].fromDeg)} during the sit, which puts scent on deer.` });
   }
@@ -394,8 +412,10 @@ function risksFor(s: Scored, req: PlanRequest, setbackM: number): Risk[] {
   if (nb && nb.distanceM < effectiveSetback(nb.area, setbackM)) risks.push({ severity: 3, text: `Only ${Math.round(nb.distanceM)} m from bedding. One mistake on entry and he's gone for days.` });
   for (const r of [s.routes.entry, s.routes.exit]) {
     if (!r) continue;
-    const bad = r.segments.find((x) => x.status === 'avoid');
-    const warn = r.segments.find((x) => x.status === 'caution');
+    // Off-property ground has its own risk above; a parking-spot scent problem is a plan warning.
+    const own = (x: Route['segments'][number]) => !x.ground && !(x.atAccess && s.shared[r.kind]);
+    const bad = r.segments.find((x) => x.status === 'avoid' && own(x));
+    const warn = r.segments.find((x) => x.status === 'caution' && own(x));
     if (bad) risks.push({ severity: 3, text: `${r.kind === 'entry' ? 'Entry' : 'Exit'}: ${bad.reason}` });
     else if (warn) risks.push({ severity: 2, text: `${r.kind === 'entry' ? 'Entry' : 'Exit'}: ${warn.reason}` });
   }
@@ -430,17 +450,22 @@ function decisionFor(s: Scored, weather: Decision, req: PlanRequest): Decision {
     if (st === 'no_go' || (st === 'caution' && status === 'go')) status = st;
   };
   if (s.routes.unreachable) raise('no_go', 'No legal walking route in from your access points. Mark another access point or skip this stand.');
+  if (s.routes.softCrossing) raise('caution', 'The only walk in crosses ground off your property (or within 50 m of a house). Get permission, or mark a different access point.');
   if (s.shiftFailures.length) raise('no_go', `Forecast wind shifts to ${compass16(s.shiftFailures[0].fromDeg)} mid-sit, a direction this stand can't handle.`);
   if (s.lightAirFailures.length) raise('caution', `${lightAirText(s.lightAirFailures[0])} Check the air at the base of the tree.`);
   if (s.margin < 15) raise('caution', 'The wind barely works. Check it at the truck and again at the base of the tree.');
-  if (s.routes.entry?.worstStatus === 'avoid') raise('caution', 'Entry route crosses a red zone. Only go if you can take the alternate edge.');
-  const exitBad = s.routes.exit?.segments.find((x) => x.status === 'avoid');
-  if (exitBad) raise('caution', `Exit crosses a red zone (${lower(exitBad.reason).replace(/\.$/, '')}). Wait for deer to clear out, or take the alternate edge.`);
+  // Red stretches that are the stand's own: not off-property ground (raised above) and not the
+  // parking-spot scent problem every stand shares (reported once as a plan warning).
+  const ownRed = (r: Route | null) => r?.segments.find((x) => x.status === 'avoid' && !x.ground && !(x.atAccess && s.shared[r.kind]));
+  const entryBad = ownRed(s.routes.entry);
+  if (entryBad) raise('caution', `Entry route crosses a red zone (${lower(entryBad.reason).replace(/\.$/, '')}). Mark a different access point, or pick another stand for this wind.`);
+  const exitBad = ownRed(s.routes.exit);
+  if (exitBad) raise('caution', `Exit crosses a red zone (${lower(exitBad.reason).replace(/\.$/, '')}). Wait for deer to clear out before you climb down, or mark a different access point.`);
   if (s.e.travelBeyondRangeYds !== null) raise('caution', `Deer travel here is ~${s.e.travelBeyondRangeYds} yds out, beyond your ${req.inputs.weapon.effectiveRangeYds} yd range.`);
   if (s.total < 45) raise('caution', 'Low odds today. Consider saving this stand for a better day.');
   if (weather.status === 'caution') for (const r of weather.reasons) raise('caution', r);
   if (s.ws.windSpeedMph < 2) raise('caution', 'Near-calm air. Scent will pool, so expect the unexpected.');
-  if (status === 'go') reasons.push('Wind, access and timing all line up.');
+  if (status === 'go') reasons.push(s.shared.entry || s.shared.exit ? 'Wind, access and timing line up once you are past the parking spot (see the plan warning about it).' : 'Wind, access and timing all line up.');
   return { status, reasons };
 }
 
@@ -454,7 +479,7 @@ export function planHunt(req: PlanRequest): Plan {
   const phase = derivePhase(inputs.date, property.stateCode, inputs.phaseOverride);
   const setbackM = inputs.beddingSetbackOverrideM ?? BEDDING_SETBACK_M[phase.phase];
   const sun = sunTimes(inputs.date, inputs.location.lat, inputs.location.lon);
-  const legal = legalHours(sun);
+  const legal = legalHoursFor(sun, inputs);
   const sit = sitWindow(inputs, phase.phase, sun);
 
   // Forecast hours that overlap the sit (an hour starting just before the sit still covers its first minutes).
@@ -494,13 +519,15 @@ export function planHunt(req: PlanRequest): Plan {
   const routePlanner = plannerFor(w.windFromDeg, habitat);
   const maxCorridorStrength = habitat.corridors.reduce((m, c) => Math.max(m, c.strength), 0);
   const midSit = new Date((sitStartMs + sitEndMs) / 2);
-  const modifiers: Modifier[] = [moonModifier(midSit, inputs.window), pressureModifier(w)];
+  const cloud = cloudCoverModifier(w, inputs.window);
+  const modifiers: Modifier[] = [moonModifier(midSit, inputs.window), pressureModifier(w), ...(cloud ? [cloud] : [])];
   const nowMs = now.getTime();
 
-  const scoreOne = (e: Evaluated, ws: WindState, weather: WeatherSnapshot, opts: { hourly?: HourlyWind[]; routePlanner?: RoutePlanner; routes?: RoutePair } = {}): Scored => {
+  const scoreOne = (e: Evaluated, ws: WindState, weather: WeatherSnapshot, opts: { hourly?: HourlyWind[]; routePlanner?: RoutePlanner; routes?: RoutePair; shared?: SharedAccess } = {}): Scored => {
     const p = e.candidate.stand.position;
     const margin = windMargin(e.passesAt, ws.windFromDeg);
     const routes = opts.routes ?? (opts.routePlanner ?? routePlanner).plan(p);
+    const shared = opts.shared ?? NOT_SHARED;
     const sightingsNear = relevantSightings(p, sightings, nowMs);
     // Re-run the gate for each forecast hour. A failure in a direction the stand handles
     // (per its dial) is light air or gusts, not a wind shift, and is reported as such.
@@ -516,7 +543,7 @@ export function planHunt(req: PlanRequest): Plan {
     if (lightAirFailures.length) softHits.push(lightAirText(lightAirFailures[0]));
     const components = [
       scoreWindFit(margin, Math.max(0, ws.windGustMph - ws.windSpeedMph), ws.windSpeedMph < LIGHT_WIND_MPH, softHits, e.model.thermalsApplied),
-      scoreAccess(routes.entry, routes.exit, routes.noAccess, routes.unreachable),
+      scoreAccess(routes.entry, routes.exit, routes.noAccess, routes.unreachable, shared),
       scoreMovement(e.ctx, maxCorridorStrength, sightingsNear, phase.phase, inputs.window),
       scoreBeddingDistance(e.ctx, setbackM),
       scoreShot(e.ctx, inputs.weapon.effectiveRangeYds, e.shotPlan.primaryBearingDeg === null || laneFor(e.shotPlan.lanes, e.shotPlan.primaryBearingDeg).status === 'open'),
@@ -525,11 +552,15 @@ export function planHunt(req: PlanRequest): Plan {
       scoreWeatherTime(weather, inputs.date, inputs.window, phase.phase, e.ctx, modifiers, sightingsNear.length > 0),
     ];
     if (e.candidate.stand.origin === 'existing') components[0].reasons.push('Your existing stand. Scored with the same rules.');
-    return { e, ws, routes, components, total: totalScore(components).total, margin, sightingsNear, shiftFailures, lightAirFailures };
+    return { e, ws, routes, shared, components, total: totalScore(components).total, margin, sightingsNear, shiftFailures, lightAirFailures };
   };
 
+  // Route every surviving stand first: a scent problem at the parking spot recurs on most of them,
+  // so it is found across stands, reported once, and not held against each stand's score.
+  const routed = survivors.map((e) => ({ e, routes: routePlanner.plan(e.candidate.stand.position) }));
+  const { hazards: accessHazards, shared: sharedAccess } = findSharedAccessHazards(routed.map((r) => r.routes));
   // A stand that is no-go on its own (forecast shift, no legal route) never ranks above a huntable one.
-  const scored = survivors.map((e) => scoreOne(e, windState, w)).sort(rankOrder);
+  const scored = routed.map(({ e, routes }) => scoreOne(e, windState, w, { routes, shared: sharedAccess.get(routes) })).sort(rankOrder);
   const huntable = scored.filter((s) => !standNoGo(s));
 
   const build = (s: Scored, rank: number, isBackup: boolean, backupNote?: string, assumedWind = false): StandRecommendation => ({
@@ -590,7 +621,7 @@ export function planHunt(req: PlanRequest): Plan {
     const pool = evaluated.filter((x) => x.windOnly && !(x.candidate.corridorId && cruiseIds.has(x.candidate.corridorId)));
     // Stage 1 (cheap): find each stand's wind and score it without routes.
     // Stage 2: route only the few best for their assumed wind, then pick.
-    const unrouted: RoutePair = { entry: null, exit: null, noAccess: true, unreachable: false };
+    const unrouted: RoutePair = { entry: null, exit: null, noAccess: true, unreachable: false, softCrossing: false };
     const options: Array<{ e: Evaluated; ws: WindState; hours: HourlyWind[]; rough: Scored }> = [];
     const tryWind = (e: Evaluated, dir: number, hours: HourlyWind[]): boolean => {
       const ws: WindState = { ...windState, windFromDeg: dir, directionSpreadDeg: hours.length ? directionSpread(dir, hours.map((h) => h.windFromDeg)) : windState.directionSpreadDeg };
@@ -632,9 +663,14 @@ export function planHunt(req: PlanRequest): Plan {
     .map((s) => build(s, scored.indexOf(s) + 1, false));
 
   const warnings: PlanWarning[] = [];
+  if (property.analysisMode === 'mock') warnings.push({ level: 'caution', text: 'Map features are sample data, not detected from your photo' });
   if (!phase.regionTuned || phase.source === 'calendar') warnings.push({ level: 'info', text: phase.note || PHASE_TACTICS[phase.phase] });
   if (!property.calibration?.originGeo) warnings.push({ level: 'info', text: 'Map not geo-referenced. Weather auto-fill, elevation and land-cover checks are off. Add two reference points to turn them on.' });
   if (!property.features.some((f) => f.status === 'active' && f.type === 'access_point')) warnings.push({ level: 'caution', text: 'No access point marked. Routes start from the nearest road or property line.' });
+  for (const h of accessHazards) warnings.push({ level: 'caution', text: accessHazardWarning(h) });
+  const reachable = scored.filter((x) => !x.routes.unreachable && !x.routes.noAccess);
+  const crossing = reachable.filter((x) => x.routes.softCrossing).length;
+  if (crossing) warnings.push({ level: 'caution', text: `${crossing === reachable.length ? 'Every walk in' : `${crossing} of ${reachable.length} walks in`} crosses ground off your property or within 50 m of a house. Get permission, or mark an access point you can use. Those stretches are red on the map.` });
   if (habitat.bedding.length === 0) warnings.push({ level: 'caution', text: 'No bedding identified. Mark known bedding for much better stand placement.' });
   if (scored.length === 0) warnings.push({ level: 'no_go', text: 'No stand passes today’s wind. Best move may be to stay out and save the property.' });
   else if (huntable.length === 0) warnings.push({ level: 'no_go', text: 'Every stand that passes today’s wind is a no-go for this sit (forecast wind shift or no legal route in). Best move may be to stay out.' });

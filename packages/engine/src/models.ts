@@ -383,6 +383,13 @@ export interface PlanInputs {
   phaseOverride?: SeasonPhase;
   /** Overrides the phase-default setback from buck bedding, meters. */
   beddingSetbackOverrideM?: number;
+  /**
+   * Minutes before sunrise that shooting is legal (the hunter's own setting; check your state's
+   * rules). Default 30 when absent. Clamped to 0..60.
+   */
+  legalMinutesBefore?: number;
+  /** Minutes after sunset that shooting is legal. Default 30 when absent. Clamped to 0..60. */
+  legalMinutesAfter?: number;
 }
 
 export type Status = 'safe' | 'caution' | 'avoid';
@@ -418,6 +425,18 @@ export interface RouteSegment {
   points: Vec[];
   status: Status;
   reason: string;
+  /**
+   * Set when this stretch is on ground the hunter may not use: off the drawn property line or within
+   * 50 m of a house. Only a walk that has no other way in crosses it (at a steep routing cost), and
+   * it is always `avoid`: get permission, or mark a different access point.
+   */
+  ground?: 'off_property' | 'house_buffer';
+  /**
+   * Set when this stretch is within about 60 m of the access point and its problem is scent (the
+   * parking spot itself is upwind of a field or bedding). When most stands share it the planner
+   * reports it once as a plan warning and does not count it against each stand.
+   */
+  atAccess?: boolean;
 }
 
 export interface Route {
@@ -513,7 +532,7 @@ export interface EliminatedStand {
 }
 
 export interface Modifier {
-  key: 'moon' | 'pressure_trend';
+  key: 'moon' | 'pressure_trend' | 'cloud_cover';
   label: string;
   detail: string;
   tag: 'low_confidence';

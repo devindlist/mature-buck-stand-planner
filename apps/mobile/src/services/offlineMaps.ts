@@ -96,53 +96,89 @@ export function packDownloadFinished(status: PackStatus, completeState: number |
   return status.percentage >= 100 && (status.completedResourceCount ?? 0) >= (status.requiredResourceCount ?? Infinity) && (status.completedTileCount ?? 0) > 0;
 }
 
+/** Downloads running right now, by pack name: a second request for the same pack joins the first. */
+const downloads = new Map<string, { promise: Promise<void>; listeners: Set<(pct: number) => void> }>();
+
+/** True while a download of this property's pack is running. */
+export function isDownloadingPack(p: Property, kind: BasemapKind): boolean {
+  return downloads.has(packName(p, kind));
+}
+
 /**
  * Download zooms 12–16 for the property (typically 2–15 MB for a farm).
  * Progress is reported 0..100. Resolves only when tiles were really saved; rejects with a
  * plain message on any failure (bad style, no signal, no progress for 90 s) so the caller
- * never reports "ready" for a pack that has no map in it.
+ * never reports "ready" for a pack that has no map in it. A pack left half-downloaded by a
+ * failure is deleted.
+ *
+ * One download per pack at a time: asking again while it runs does NOT restart it (that
+ * would delete the pack the first request is filling); the second caller just follows the
+ * first one's progress and result.
  */
-export async function downloadOfflinePack(p: Property, kind: BasemapKind, onProgress: (pct: number) => void): Promise<void> {
+export function downloadOfflinePack(p: Property, kind: BasemapKind, onProgress: (pct: number) => void): Promise<void> {
+  const name = packName(p, kind);
+  const running = downloads.get(name);
+  if (running) {
+    running.listeners.add(onProgress);
+    return running.promise;
+  }
+  const listeners = new Set<(pct: number) => void>([onProgress]);
+  const promise = runDownload(p, kind, (pct) => listeners.forEach((l) => l(pct))).finally(() => downloads.delete(name));
+  downloads.set(name, { promise, listeners });
+  return promise;
+}
+
+async function runDownload(p: Property, kind: BasemapKind, onProgress: (pct: number) => void): Promise<void> {
   const bounds = propertyBoundsLngLat(p);
   if (!bounds) throw new Error('Geo-reference the map (two reference points) to download offline basemaps.');
   const name = packName(p, kind);
   const styleURL = await writeStyleFile(kind);
   const existing = await OfflineManager.getPack(name);
   if (existing) await OfflineManager.deletePack(name);
-  await new Promise<void>((resolve, reject) => {
-    let settled = false;
-    let watchdog: ReturnType<typeof setTimeout> | undefined;
-    const finish = (err?: Error) => {
-      if (settled) return;
-      settled = true;
-      if (watchdog) clearTimeout(watchdog);
-      try {
-        OfflineManager.unsubscribe(name);
-      } catch {
-        /* nothing subscribed */
-      }
-      if (err) reject(err);
-      else resolve();
-    };
-    const arm = () => {
-      if (watchdog) clearTimeout(watchdog);
-      watchdog = setTimeout(() => finish(new Error('The download stopped making progress. Check your signal and try again.')), STALL_MS);
-    };
-    arm();
-    // createPack is async: a rejected promise (bad options, native failure) must reach the caller.
-    OfflineManager.createPack(
-      { name, styleURL, bounds, minZoom: 12, maxZoom: 16, metadata: { propertyId: p.id } },
-      (_pack: unknown, status: PackStatus) => {
-        arm();
-        onProgress(Number.isFinite(status.percentage) ? Math.max(0, Math.min(100, Math.round(status.percentage))) : 0);
-        if (!packDownloadFinished(status)) return;
-        if (!((status.completedTileCount ?? 0) > 0)) {
-          finish(new Error('The download finished but saved no map tiles, so the offline basemap would be blank. Try again on a good connection.'));
-          return;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let watchdog: ReturnType<typeof setTimeout> | undefined;
+      const finish = (err?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (watchdog) clearTimeout(watchdog);
+        try {
+          OfflineManager.unsubscribe(name);
+        } catch {
+          /* nothing subscribed */
         }
-        finish();
-      },
-      (_pack: unknown, err: { message?: string }) => finish(new Error(err?.message || 'The offline map download failed.')),
-    ).catch((e: unknown) => finish(e instanceof Error ? e : new Error(String(e))));
-  });
+        if (err) reject(err);
+        else resolve();
+      };
+      const arm = () => {
+        if (watchdog) clearTimeout(watchdog);
+        watchdog = setTimeout(() => finish(new Error('The download stopped making progress. Check your signal and try again.')), STALL_MS);
+      };
+      arm();
+      // createPack is async: a rejected promise (bad options, native failure) must reach the caller.
+      OfflineManager.createPack(
+        { name, styleURL, bounds, minZoom: 12, maxZoom: 16, metadata: { propertyId: p.id } },
+        (_pack: unknown, status: PackStatus) => {
+          arm();
+          onProgress(Number.isFinite(status.percentage) ? Math.max(0, Math.min(100, Math.round(status.percentage))) : 0);
+          if (!packDownloadFinished(status)) return;
+          if (!((status.completedTileCount ?? 0) > 0)) {
+            finish(new Error('The download finished but saved no map tiles, so the offline basemap would be blank. Try again on a good connection.'));
+            return;
+          }
+          finish();
+        },
+        (_pack: unknown, err: { message?: string }) => finish(new Error(err?.message || 'The offline map download failed.')),
+      ).catch((e: unknown) => finish(e instanceof Error ? e : new Error(String(e))));
+    });
+  } catch (e) {
+    // A failed download must not leave a partial pack registered as if it were the offline map.
+    try {
+      await OfflineManager.deletePack(name);
+    } catch {
+      /* the pack was never created */
+    }
+    throw e;
+  }
 }

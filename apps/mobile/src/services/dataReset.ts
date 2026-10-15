@@ -1,6 +1,6 @@
 import { OfflineManager } from '@maplibre/maplibre-react-native';
 import { DEFAULT_SETTINGS, useAppStore } from '../state/store';
-import { wipeAllData } from '../db/database';
+import { deleteMapPhotos, wipeAllData } from '../db/database';
 import { cancelAllScheduled } from './checkin';
 import { forgetHunts } from './huntSession';
 import { nextSit } from '../utils/format';
@@ -23,8 +23,10 @@ async function deleteOfflineMaps(): Promise<void> {
 /**
  * Settings → Delete all data. Removes, from this phone: every table (properties, plans,
  * hunts, sightings, pressure, weather, cache, settings incl. the emergency contact), the
- * map photos, offline map packs and tile cache, and every scheduled check-in alarm. The
- * database key is rotated so nothing deleted can be decrypted from an old backup.
+ * map photos (the encrypted copy goes with the database; the cache files and the picker and
+ * image-manipulator temporary copies are deleted), offline map packs and tile cache, and
+ * every scheduled check-in alarm. The database key is rotated so nothing deleted can be
+ * decrypted from an old backup.
  * Returns the parts that could not be removed (empty when everything went).
  */
 export async function deleteAllData(): Promise<string[]> {
@@ -33,9 +35,12 @@ export async function deleteAllData(): Promise<string[]> {
   await forgetHunts();
   await deleteOfflineMaps().catch(() => failed.push('offline maps'));
   try {
-    await wipeAllData();
+    const report = await wipeAllData();
+    if (!report.photosRemoved) failed.push('map photo copies');
   } catch {
     failed.push('the database');
+    // The photo copies are files: remove them even though the database would not wipe.
+    await deleteMapPhotos().catch(() => failed.push('map photo copies'));
   }
   useAppStore.getState().set({
     properties: [],

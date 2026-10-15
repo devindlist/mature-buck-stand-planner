@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { planHunt, windDial, MIN_PICK_SPACING_M, UNREACHABLE_RISK } from './planner.ts';
+import { planHunt, windDial, MIN_PICK_SPACING_M, SOFT_CROSSING_RISK, UNREACHABLE_RISK } from './planner.ts';
 import { at, fixtureProperty, inputs, weather, userFeature } from './test/fixtures.ts';
 import { dist, compass16, downwindBearing, normDeg } from './geo/geometry.ts';
 import type { HourlyWind, MapFeature, Plan, Property, SitWindow, Sighting, Stand, StandRecommendation, Vec } from './models.ts';
@@ -104,14 +104,29 @@ test('a forecast wind shift into a stand’s bad wind makes it no-go', () => {
   // (A wind-shift fallback backup is judged for its own assumed wind, not this forecast.)
   const listed = [...shifted.recommendations, ...(shifted.backup && shifted.backup.assumedWindFromDeg === undefined ? [shifted.backup] : [])];
   const again = listed.find((r) => r.stand.name === top.stand.name);
-  if (again) {
-    assert.equal(again.decision.status, 'no_go');
-    assert.match(again.risks.map((r) => r.text).join(' '), /Forecast swings/);
-  }
+  assert.ok(again, 'stand still listed so the hunter sees why it is a no-go');
+  assert.equal(again.decision.status, 'no_go');
+  assert.match(again.risks.map((r) => r.text).join(' '), /Forecast swings/);
   // It never outranks a stand that is still huntable through the shift.
   const firstNoGo = shifted.recommendations.findIndex((r) => r.decision.status === 'no_go');
   if (firstNoGo >= 0) assert.ok(shifted.recommendations.slice(firstNoGo).every((r) => r.decision.status === 'no_go'), 'no-go stands rank last');
-  assert.ok(!again || again.isBackup || again.rank > shifted.recommendations.filter((r) => r.decision.status !== 'no_go').length);
+  assert.ok(again.isBackup || again.rank > shifted.recommendations.filter((r) => r.decision.status !== 'no_go').length);
+});
+
+test('a hunter’s own stand that a forecast shift makes no-go is still shown, with the reason', () => {
+  // Same position as the top generated stand; the last hour of the PM sit swings 45° the wrong way.
+  const base = planHunt({ property: fixtureProperty(), inputs: inputs(), now: NOW });
+  const mine: Stand = { id: 'mine', propertyId: 'prop-1', name: 'Big Oak', position: base.recommendations[0].stand.position, origin: 'existing', type: 'ladder' };
+  const sit = base.recommendations[0].sitWindow;
+  const s0 = Math.floor(Date.parse(sit.start) / 3_600_000) * 3_600_000;
+  const n = Math.ceil((Date.parse(sit.end) - s0) / 3_600_000);
+  const hourly: HourlyWind[] = Array.from({ length: n }, (_, i) => ({ at: new Date(s0 + i * 3_600_000).toISOString(), windFromDeg: i >= n - 1 ? 270 : 315, windSpeedMph: 9, windGustMph: 14, tempF: 38 }));
+  const plan = planHunt({ property: fixtureProperty({ stands: [mine] }), inputs: inputs({ weather: weather({ hourly }) }), now: NOW });
+  const r = [...plan.recommendations, ...(plan.backup ? [plan.backup] : []), ...plan.yourStands].find((x) => x.stand.id === 'mine');
+  assert.ok(r, 'the hunter’s stand is listed, not silently dropped');
+  assert.equal(r.decision.status, 'no_go');
+  assert.match(r.risks.map((x) => x.text).join(' '), /Forecast swings to W/);
+  assert.match(r.decision.reasons.join(' '), /Forecast wind shifts to W/);
 });
 
 test('observed mature buck sightings raise movement and are tagged as observed data', () => {
@@ -495,4 +510,136 @@ test('less likely food is a caution, never an elimination', () => {
   assert.ok(!plan.eliminated.some((e) => /the acorns/.test(e.reasons.join(' '))));
   const warned = allRecs(plan).filter((r) => r.score.components.find((c) => c.key === 'windFit')?.reasons.some((x) => /drift toward the acorns/.test(x)));
   assert.ok(warned.length > 0, 'scent drifting into the oaks is still flagged');
+});
+
+// ---------------------------------------------------------------------------
+// Soft blocks, the parking spot, legal hours, sample data and cloud cover
+// ---------------------------------------------------------------------------
+
+test('a parking spot 250 m outside the property line is a caution with a permission risk, never a wall of no-gos', () => {
+  const farOut = (property: Property, y: number) => {
+    property.features = property.features.filter((f) => f.type !== 'access_point');
+    property.features.push(userFeature('truck', 'access_point', [{ x: 168, y }], 'point', { label: 'Pull-off' }));
+    return property;
+  };
+  const south = Math.min(...fixtureProperty().boundary!.map((p) => p.y));
+  const plan = planHunt({ property: farOut(fixtureProperty(), south - 250), inputs: inputs(), now: NOW });
+  assert.equal(plan.weatherDecision.status, 'go');
+  const recs = allRecs(plan).filter((r) => r.assumedWindFromDeg === undefined);
+  assert.ok(recs.length >= 3);
+  for (const r of recs) {
+    assert.notEqual(r.decision.status, 'no_go', `${r.stand.name}: ${r.decision.reasons.join(' | ')}`);
+    assert.ok(r.entryRoute && r.exitRoute, `${r.stand.name} has routes`);
+    assert.ok(!r.risks.some((x) => x.text === UNREACHABLE_RISK));
+    assert.equal(r.decision.status, 'caution', `${r.stand.name} crosses off-property ground`);
+    assert.ok(r.risks.some((x) => x.severity === 3 && x.text === SOFT_CROSSING_RISK), `${r.stand.name}: ${r.risks.map((x) => x.text).join(' | ')}`);
+    assert.ok(r.decision.reasons.some((x) => /off your property/.test(x)));
+    assert.ok(r.entryRoute.segments.some((x) => x.ground === 'off_property' && x.status === 'avoid'));
+    assert.ok((r.score.components.find((c) => c.key === 'accessStealth')?.value ?? 0) > 0, 'not scored as unreachable');
+  }
+  assert.ok(plan.warnings.some((w) => w.level === 'caution' && /crosses ground off your property/.test(w.text)));
+  assert.match(SOFT_CROSSING_RISK, /^Walk crosses ground off your property: get permission or mark a different access point/);
+  // With no access point marked, a road 300 m outside the line is the inferred start: same outcome.
+  const roadProperty = fixtureProperty();
+  roadProperty.features = roadProperty.features.filter((f) => f.type !== 'access_point' && f.type !== 'road');
+  roadProperty.features.push(userFeature('road', 'road', [{ x: -900, y: south - 300 }, { x: 900, y: south - 300 }], 'line', { label: 'Far road' }));
+  const viaRoad = planHunt({ property: roadProperty, inputs: inputs(), now: NOW });
+  assert.ok(allRecs(viaRoad).length > 0);
+  for (const r of allRecs(viaRoad).filter((x) => x.assumedWindFromDeg === undefined)) assert.notEqual(r.decision.status, 'no_go', `${r.stand.name} via inferred road`);
+});
+
+test('a farmhouse in the only gap makes the stand a caution, not a no-go', () => {
+  const neck = bareProperty(
+    [
+      userFeature('h', 'house', [{ x: 0, y: 0 }], 'point'),
+      line('e', 'edge', [
+        [-10, 300],
+        [-10, 450],
+      ]),
+      userFeature('a', 'access_point', [{ x: 0, y: -560 }], 'point', { label: 'Road' }),
+    ],
+    [myStand(0, 480)],
+  );
+  neck.boundary = rect(-35, -600, 35, 600);
+  const plan = planHunt({ property: neck, inputs: inputs({ date: '2026-09-20', weather: weather({ windFromDeg: 270, windSpeedMph: 10 }) }), now: NOW });
+  const r = allRecs(plan).find((x) => x.stand.id === 'mine');
+  assert.ok(r, 'the hunter’s stand is scored');
+  assert.notEqual(r.decision.status, 'no_go', r.decision.reasons.join(' | '));
+  assert.ok(r.entryRoute?.segments.some((x) => x.ground === 'house_buffer'));
+  assert.ok(r.risks.some((x) => x.text === SOFT_CROSSING_RISK));
+});
+
+test('a parking spot upwind of the field is one plan-level warning, not a caution on every stand', () => {
+  // Fixture "Field gate" is upwind of the bean field in a S wind on a morning walk in.
+  const plan = planHunt({ property: fixtureProperty(), inputs: inputs({ window: 'AM', weather: weather({ windFromDeg: 180 }) }), now: NOW });
+  const hazard = plan.warnings.filter((w) => /^Your parking spot \(Field gate\)/.test(w.text));
+  assert.equal(hazard.length, 1, 'said once');
+  assert.equal(hazard[0].level, 'caution');
+  assert.match(hazard[0].text, /Park somewhere else, approach from the other side, or mark another access point/);
+  assert.match(hazard[0].text, /upwind of the field/);
+  const affected = allRecs(plan).filter((r) => r.assumedWindFromDeg === undefined && r.entryRoute?.segments.some((x) => x.atAccess));
+  assert.ok(affected.length >= 2, 'the parking spot hits several stands');
+  for (const r of affected) {
+    const ownRed = r.entryRoute!.segments.some((x) => x.status === 'avoid' && !x.atAccess);
+    const access = r.score.components.find((c) => c.key === 'accessStealth')!;
+    if (!ownRed) {
+      // The stretch by the truck is red on the map, but it is not held against this stand.
+      assert.ok(!access.reasons.some((x) => /^Entry: Wind carries your scent onto feeding deer/.test(x)), `${r.stand.name}: ${access.reasons.join(' | ')}`);
+      assert.ok(!r.decision.reasons.some((x) => /^Entry route crosses a red zone \(wind carries your scent onto feeding deer/.test(x)), `${r.stand.name}: ${r.decision.reasons.join(' | ')}`);
+      assert.ok(!r.risks.some((x) => /^Entry: Wind carries your scent onto feeding deer/.test(x.text)), `${r.stand.name}: ${r.risks.map((x) => x.text).join(' | ')}`);
+    }
+    // The map still shows it.
+    assert.ok(r.entryRoute!.segments.some((x) => x.atAccess && x.status !== 'safe'));
+  }
+  // A plain GO says why it is only a GO past the truck.
+  for (const r of affected.filter((x) => x.decision.status === 'go')) assert.match(r.decision.reasons.join(' '), /past the parking spot/);
+  // The wind from the other side clears the problem, and the warning with it.
+  const calm = planHunt({ property: fixtureProperty(), inputs: inputs({ window: 'AM', weather: weather({ windFromDeg: 0 }) }), now: NOW });
+  assert.ok(!calm.warnings.some((w) => /^Your parking spot/.test(w.text)));
+});
+
+test('legal shooting hours follow the hunter’s setting, and the plan says so', () => {
+  const dflt = planHunt({ property: fixtureProperty(), inputs: inputs(), now: NOW });
+  const min = (a: string, b: string) => (Date.parse(a) - Date.parse(b)) / 60_000;
+  assert.equal(min(dflt.sun.sunrise, dflt.legal.start), 30);
+  assert.equal(min(dflt.legal.end, dflt.sun.sunset), 30);
+  assert.match(dflt.legal.rule, /typical/);
+  for (const window of ['AM', 'PM'] as const) {
+    const plan = planHunt({ property: fixtureProperty(), inputs: inputs({ window, legalMinutesBefore: 15, legalMinutesAfter: 0 }), now: NOW });
+    assert.equal(min(plan.sun.sunrise, plan.legal.start), 15);
+    assert.equal(plan.legal.end, plan.sun.sunset);
+    assert.equal(plan.legal.rule, '15 min before sunrise to 0 min after sunset: your setting');
+    const sit = plan.recommendations[0].sitWindow;
+    if (window === 'AM') assert.equal(sit.start, plan.legal.start, 'the AM sit starts at the setting’s legal light');
+    else assert.equal(sit.end, plan.legal.end, 'the PM sit ends at the setting’s legal light, not 30 min after sunset');
+  }
+});
+
+test('a sample-data (mock) map gets a plan-level caution; a real analysis does not', () => {
+  const mock = planHunt({ property: fixtureProperty({ analysisMode: 'mock' }), inputs: inputs(), now: NOW });
+  const w = mock.warnings.filter((x) => x.text === 'Map features are sample data, not detected from your photo');
+  assert.equal(w.length, 1);
+  assert.equal(w[0].level, 'caution');
+  for (const mode of ['proxy', 'manual', undefined] as const) {
+    assert.ok(!planHunt({ property: fixtureProperty({ analysisMode: mode }), inputs: inputs(), now: NOW }).warnings.some((x) => /sample data/.test(x.text)), String(mode));
+  }
+  // It shows on the offline plan card too.
+  assert.ok(buildPlanCard(mock, 'Ridge Farm', (iso) => iso.slice(11, 16)).warnings.some((x) => /sample data/.test(x)));
+});
+
+test('cloud cover changes the plan: a small, tagged, low-confidence modifier inside weather & time fit', () => {
+  // Steady pressure and a mild day keep the 5-point fit (and the ±0.75 modifier cap) from hiding the effect.
+  const plan = (cloud: number | undefined) => planHunt({ property: fixtureProperty(), inputs: inputs({ weather: weather({ cloudCoverPct: cloud, pressureTrend: 'steady', tempF: 50 }) }), now: NOW });
+  const overcast = plan(100);
+  const clear = plan(10);
+  const mod = overcast.modifiers.find((m) => m.key === 'cloud_cover');
+  assert.ok(mod && mod.tag === 'low_confidence' && mod.points > 0 && mod.points <= 0.3, JSON.stringify(mod));
+  assert.equal(clear.modifiers.find((m) => m.key === 'cloud_cover')?.points, 0);
+  assert.ok(!plan(undefined).modifiers.some((m) => m.key === 'cloud_cover'), 'unknown cloud cover is not a modifier');
+  const wx = (p: Plan) => p.recommendations[0].score.components.find((c) => c.key === 'weatherTimeFit')!;
+  assert.ok(wx(overcast).value > wx(clear).value, 'overcast nudges the fit up');
+  assert.ok(wx(overcast).value - wx(clear).value <= 0.75, 'and only a little');
+  assert.ok(wx(overcast).tags.includes('low_confidence'));
+  assert.ok(wx(overcast).reasons.some((r) => /^\[Low confidence\] Cloud cover: Overcast/.test(r)));
+  assert.ok(planCardText(buildPlanCard(overcast, 'Ridge Farm', (iso) => iso.slice(11, 16))).includes('[low confidence] Cloud cover:'));
 });

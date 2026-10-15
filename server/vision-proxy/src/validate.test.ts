@@ -15,6 +15,7 @@ import {
   watchRequest,
   type ClosableResponse,
 } from './validate.ts';
+import { MAX_VISION_BASE64_CHARS } from '../../../packages/engine/src/vision/client.ts';
 
 const img = 'A'.repeat(400);
 
@@ -52,7 +53,15 @@ test('rate limiter: fixed window per key', () => {
 test('oversize image error names the current 2576 px limit, and the cap stays under the API 5 MB per-image limit', () => {
   const big = validateAnalyzeRequest({ imageBase64: 'A'.repeat(MAX_IMAGE_BASE64_CHARS + 1), mediaType: 'image/jpeg' });
   assert.ok(!big.ok && /2576/.test(big.error) && !/1568/.test(big.error));
+  // Under 5 MB whichever way the API counts it: decoded bytes OR the base64 text itself.
   assert.ok((MAX_IMAGE_BASE64_CHARS * 3) / 4 < 5_000_000, 'decoded size must stay under 5 MB');
+  assert.ok(MAX_IMAGE_BASE64_CHARS <= 5_000_000, 'base64 length must stay under 5,000,000 characters');
+  // The app checks the same number before it sends, so it never uploads what the proxy would refuse.
+  assert.equal(MAX_IMAGE_BASE64_CHARS, MAX_VISION_BASE64_CHARS, 'proxy and engine caps must match');
+  assert.ok(validateAnalyzeRequest({ imageBase64: 'A'.repeat(MAX_IMAGE_BASE64_CHARS), mediaType: 'image/jpeg' }).ok, 'exactly at the cap is accepted');
+  // 5.2M characters (decoded 3.9 MB, but over 5 MB read as base64 text) is refused here, not by the API.
+  const over = validateAnalyzeRequest({ imageBase64: 'A'.repeat(5_200_000), mediaType: 'image/jpeg' });
+  assert.ok(!over.ok && over.status === 413);
   // A 2576 px JPEG (a few MB at most) must still be accepted.
   assert.ok(validateAnalyzeRequest({ imageBase64: 'A'.repeat(4_000_000), mediaType: 'image/jpeg' }).ok);
 });

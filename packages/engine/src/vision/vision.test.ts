@@ -6,10 +6,10 @@ import { analyzeMapPhoto, VisionError } from './client.ts';
 import { crossCheckFeatures, cropFromCdl, nlcdCheck, sampleElevationGrid, type LandDataProvider } from './crossCheck.ts';
 import { calibrationFromNorthAndScale } from '../calibration/calibration.ts';
 import { geoToLocal } from '../geo/localFrame.ts';
-import { cropForPlanning, inferFood } from '../inference/habitat.ts';
+import { cropForPlanning, FOOD_SENSITIVE_MIN, inferFood } from '../inference/habitat.ts';
 
-/** The planner's food floor for the wind gate (planner.ts FOOD_SENSITIVE_MIN). */
-const FOOD_GATE_MIN = 0.3;
+/** The planner's food floor for the wind gate (shared with the route judge, inference/habitat.ts). */
+const FOOD_GATE_MIN = FOOD_SENSITIVE_MIN;
 import type { LatLon, MapFeature } from '../models.ts';
 import { FEATURE_TYPES } from '../models.ts';
 

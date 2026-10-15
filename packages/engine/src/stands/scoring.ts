@@ -72,32 +72,39 @@ export function scoreWindFit(marginDeg: number, gustSpreadMph: number, light: bo
 /**
  * `unreachable`: start points exist but no legal walk reaches the stand (it sits in a
  * no-access zone, or water, a no-access zone or a neighbor line cuts it off). That is
- * zero stealth, not an unknown, so it never gets the benefit of the doubt.
+ * zero stealth, not an unknown, so it never gets the benefit of the doubt. Ground off the
+ * property line or near a house never makes a stand unreachable: those stretches show up as red
+ * segments (`ground`) on the route and cost points like any other red stretch.
+ *
+ * `shared`: scent problems right at the parking spot (`atAccess` segments) that the planner has
+ * reported once, plan-wide, because most stands share them. They are the same on every stand
+ * and no choice of stand clears them, so they are not held against this one.
  */
-export function scoreAccess(entry: Route | null, exit: Route | null, noAccess: boolean, unreachable = false): ScoreComponent {
+export function scoreAccess(entry: Route | null, exit: Route | null, noAccess: boolean, unreachable = false, shared?: { entry: boolean; exit: boolean }): ScoreComponent {
   const reasons: string[] = [];
   if (unreachable) {
     return comp('accessStealth', 'Access stealth', WEIGHTS.accessStealth, 0, [
-      "No legal walking route from your access points to this stand: a no-access zone, water, a neighbor's line or the property line is in the way.",
+      'No legal walking route from your access points to this stand: a no-access zone, water or a neighbor’s line is in the way.',
     ]);
   }
   if (noAccess || !entry) {
     return comp('accessStealth', 'Access stealth', WEIGHTS.accessStealth, 8, ['No access point or road mapped, so the route could not be checked. Mark where you park.']);
   }
-  const penalty = (r: Route, weight: number, label: string) => {
-    const avoid = r.segments.filter((s) => s.status === 'avoid');
-    const caution = r.segments.filter((s) => s.status === 'caution');
+  const penalty = (r: Route, weight: number, label: string, skipAtAccess: boolean) => {
+    const counts = (x: Route['segments'][number]) => !(skipAtAccess && x.atAccess);
+    const avoid = r.segments.filter((s) => s.status === 'avoid' && counts(s));
+    const caution = r.segments.filter((s) => s.status === 'caution' && counts(s));
     let p = Math.min(16, avoid.length * 8) + Math.min(9, caution.length * 3);
     if (avoid.length) reasons.push(`${label}: ${avoid[0].reason}`);
     else if (caution.length) reasons.push(`${label}: ${caution[0].reason}`);
-    else reasons.push(`${label} stays clear of bedding, feeding deer and travel.`);
+    else reasons.push(`${label} stays clear of bedding, feeding deer and travel${skipAtAccess && r.segments.some((x) => x.atAccess) ? ' (apart from the parking spot, which the plan warning covers)' : ''}.`);
     if (r.lengthM > 1200) {
       p += 2;
       reasons.push(`${label} is long (${Math.round(r.lengthM)} m), which means more chances to bump deer.`);
     }
     return p * weight;
   };
-  let v = WEIGHTS.accessStealth - penalty(entry, 1, 'Entry') - (exit ? penalty(exit, 0.75, 'Exit') : 6);
+  let v = WEIGHTS.accessStealth - penalty(entry, 1, 'Entry', !!shared?.entry) - (exit ? penalty(exit, 0.75, 'Exit', !!shared?.exit) : 6);
   if (!exit) reasons.push('No separate exit route found.');
   if ((entry.overlapWithOther ?? 0) > 0.6) {
     v -= 2;
@@ -319,7 +326,7 @@ export function scoreWeatherTime(
     v += modPoints;
     tags.push('low_confidence');
     for (const m of modifiers) reasons.push(`[Low confidence] ${m.label}: ${m.detail}`);
-    if (hasObservedData) reasons.push('Your observed deer activity outranks moon and pressure, so their effect was reduced.');
+    if (hasObservedData) reasons.push('Your observed deer activity outranks moon, pressure and cloud cover, so their effect was reduced.');
   }
   return comp('weatherTimeFit', 'Weather & time fit', max, v, reasons, tags);
 }

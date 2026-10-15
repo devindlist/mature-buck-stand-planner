@@ -1,8 +1,8 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import { Alert, Pressable, ScrollView, Text, View } from 'react-native';
 import { router } from 'expo-router';
 import { DISCLAIMER, type WeaponType } from '@msp/engine';
-import { DEFAULT_RANGE_YDS, MAX_RANGE_YDS, useAppStore, type Settings } from '../src/state/store';
+import { DEFAULT_RANGE_YDS, LEGAL_MINUTES_MAX, LEGAL_MINUTES_MIN, MAX_RANGE_YDS, useAppStore, type Settings } from '../src/state/store';
 import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Body, Disclaimer, Field, Label, Screen, Segmented, Stepper } from '../src/components/ui';
 import { setSetting } from '../src/db/repos';
@@ -23,6 +23,9 @@ export default function SettingsScreen() {
   const set = useAppStore((s) => s.set);
   const property = useAppStore((s) => s.activeProperty());
   const [pack, setPack] = useState<string | null>(null);
+  const [downloading, setDownloading] = useState(false);
+  // Set synchronously, so a double tap in the same frame can't start a second download.
+  const downloadingRef = useRef(false);
   const [notif, setNotif] = useState<string | null>(null);
   const [wiping, setWiping] = useState(false);
 
@@ -63,13 +66,18 @@ export default function SettingsScreen() {
   const rangeMismatch = settings.defaultRangeYds > MAX_RANGE_YDS[settings.defaultWeapon];
 
   const downloadMaps = async () => {
-    if (!property) return;
+    if (!property || downloadingRef.current) return;
+    downloadingRef.current = true;
+    setDownloading(true);
     try {
       setPack('Starting…');
       await downloadOfflinePack(property, 'imageryTopo', (pct) => setPack(`Downloading USGS imagery/topo… ${pct}%`));
       setPack('Offline basemap ready ✓');
     } catch (e) {
       setPack(e instanceof Error ? e.message : 'Download failed');
+    } finally {
+      downloadingRef.current = false;
+      setDownloading(false);
     }
   };
 
@@ -116,6 +124,11 @@ export default function SettingsScreen() {
           </Text>
         ) : null}
 
+        <Label>LEGAL HOURS</Label>
+        <Body dim>Check your state's rules; many Midwest states use 30/30. Plans and Hunt mode use these to show legal shooting light.</Body>
+        <Stepper label="Legal hours: minutes before sunrise" value={settings.legalMinutesBefore} onChange={(v) => update({ legalMinutesBefore: v })} step={5} min={LEGAL_MINUTES_MIN} max={LEGAL_MINUTES_MAX} unit="min" />
+        <Stepper label="Legal hours: minutes after sunset" value={settings.legalMinutesAfter} onChange={(v) => update({ legalMinutesAfter: v })} step={5} min={LEGAL_MINUTES_MIN} max={LEGAL_MINUTES_MAX} unit="min" />
+
         <Label>DISPLAY & PRIVACY</Label>
         {toggle('Red-light theme', redLight, () => set({ redLight: !redLight }), 'Hunt mode turns this on automatically')}
         {toggle('Haptics', settings.haptics, () => update({ haptics: !settings.haptics }), 'Off by default. The app plays no sounds; on iPhone, check-in reminders use the system alert (ring switch on silent = vibrate only).')}
@@ -126,12 +139,19 @@ export default function SettingsScreen() {
 
         <Label>OFFLINE MAPS</Label>
         <Body dim>Download USGS imagery and topo for the active property (zoom 12–16, public domain) so the basemap works with no signal.</Body>
-        <BigButton label="Download offline basemap" kind="secondary" disabled={!property?.calibration?.originGeo} onPress={() => void downloadMaps()} sublabel={property?.calibration?.originGeo ? property.name : 'Geo-reference the map first'} />
+        <BigButton
+          label={downloading ? 'Downloading…' : 'Download offline basemap'}
+          kind="secondary"
+          loading={downloading}
+          disabled={!property?.calibration?.originGeo || downloading}
+          onPress={() => void downloadMaps()}
+          sublabel={property?.calibration?.originGeo ? property.name : 'Geo-reference the map first'}
+        />
         {pack ? <Text style={{ color: t.textDim }}>{pack}</Text> : null}
 
         <Label>DATA</Label>
         <Body dim>
-          Properties, plans, hunts, sightings and settings are stored on this phone in an encrypted database; its key stays in this phone's Keychain/Keystore and never moves to another phone. Map photos are kept as image files in the app's private storage (not encrypted, and included in your phone's iCloud backup on iPhone).
+          Properties, plans, hunts, sightings and settings are stored on this phone in an encrypted database; its key stays in this phone's Keychain/Keystore and never moves to another phone. Map photos are stored inside that same encrypted database. A working copy of each photo is kept in the app's private cache (not backed up) and rebuilt from the database whenever it is missing; Delete all data removes both, and the temporary copies your photo picker made.
         </Body>
         <BigButton
           label="Delete all data"

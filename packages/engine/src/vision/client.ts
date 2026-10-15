@@ -42,10 +42,14 @@ export const MAX_VISION_EDGE_PX = 2576;
 export const MAX_VISION_PIXELS = 3_750_000;
 
 /**
- * Largest base64 payload the app should send. Keeps the decoded JPEG under the API's 5 MB
- * per-image cap; the proxy (validate.ts MAX_IMAGE_BASE64_CHARS) rejects anything larger.
+ * Largest base64 payload the app should send: 5,000,000 characters. The API's per-image cap is
+ * 5 MB, and whether it is counted on decoded bytes (about 6.67M base64 characters) or on the base64
+ * text is not confirmed offline, so this is deliberately conservative: it keeps the payload under
+ * 5 MB under either reading (5M characters decode to 3.75 MB). A JPEG of at most 3.75 MP at quality
+ * 0.6-0.8 is normally well under it. The proxy (validate.ts MAX_IMAGE_BASE64_CHARS) uses the same
+ * number and rejects anything larger; the app re-encodes once at lower quality above it.
  */
-export const MAX_VISION_BASE64_CHARS = 6_600_000;
+export const MAX_VISION_BASE64_CHARS = 5_000_000;
 
 export interface FittedImage {
   width: number;

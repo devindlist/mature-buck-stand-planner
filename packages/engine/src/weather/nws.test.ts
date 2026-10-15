@@ -145,6 +145,19 @@ test('fetchSnapshot walks points → hourly/grid/stations → observations with 
   assert.ok(seen.some((u) => u.includes('/stations/KAMW/observations')));
 });
 
+test('the /points lookup sends the location rounded to 3 decimals, never the exact position', async () => {
+  const seen: string[] = [];
+  const fakeFetch = (async (url: string) => {
+    seen.push(url);
+    if (url.includes('/points/')) return new Response(JSON.stringify(POINT), { status: 200 });
+    throw new Error('stop after /points');
+  }) as unknown as typeof fetch;
+  await assert.rejects(fetchSnapshot({ lat: 41.851234, lon: -93.309876 }, '2026-11-08T00:00:00Z', '2026-11-08T04:00:00Z', { fetchFn: fakeFetch, userAgent: 'StandPlanner/0.1' }));
+  const points = seen.find((u) => u.includes('/points/'));
+  assert.ok(points?.endsWith('/points/41.851,-93.310'), points);
+  assert.ok(!seen.some((u) => /41\.8512|93\.3098/.test(u)), 'no 4+ decimal coordinates leave the phone');
+});
+
 test('weather safety gates', () => {
   assert.equal(assessWeather(weather()).status, 'go');
   assert.equal(assessWeather(weather({ precipType: 'thunderstorm' })).status, 'no_go');

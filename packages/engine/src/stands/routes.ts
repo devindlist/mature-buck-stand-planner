@@ -17,7 +17,7 @@ import {
   sectorPolygon,
   segmentsIntersect,
 } from '../geo/geometry.ts';
-import { BEDDING_MIN_PROB, distanceToArea, edgePointToward } from '../inference/habitat.ts';
+import { BEDDING_MIN_PROB, FOOD_SENSITIVE_MIN, distanceToArea, edgePointToward } from '../inference/habitat.ts';
 import { effectiveSetback, noAccessZones } from './candidates.ts';
 
 /**
@@ -31,8 +31,12 @@ import { effectiveSetback, noAccessZones } from './candidates.ts';
  * Exit routes are pushed off the entry path so the two stay separate.
  *
  * Hunter constraints are hard: no route enters a no-access zone or water, crosses a
- * neighbor line, or skips a must-use gate. Off-property ground and house buffers are
- * only walkable right by the truck or the stand (parking at the farmhouse, on the road shoulder).
+ * neighbor line, or skips a must-use gate. Only those HARD blocks make a stand unreachable.
+ * Off-property ground and house buffers are SOFT blocks: free to use right by the truck or the
+ * stand (parking at the farmhouse, on the road shoulder), and otherwise crossed only when there is
+ * no other way in, at a steep cost, with those stretches flagged red ("get permission or mark a
+ * different access point"). A parking spot a long way outside the line therefore gives a
+ * caution, never a false "no legal route".
  */
 
 export type WalkKind = 'entry' | 'exit';
@@ -83,12 +87,34 @@ export const BLOCK_HARD = 2;
 const ESCAPE_M = 100;
 /** Per-meter cost of that ground: used only when there is no other way out. */
 const ESCAPE_COST = 25;
+/**
+ * Per-meter cost of soft-blocked ground anywhere on the map, in the second routing pass that runs
+ * only when no walk exists without it. Steeper than any bedding intrusion, so the route crosses as
+ * little of it as possible.
+ */
+const SOFT_CROSSING_COST = 60;
+/** A scent problem that starts this close to the access point (by piece midpoint) is "at the parking spot". */
+export const ACCESS_ZONE_M = 60;
+/** ...and it stays "the parking spot's" while it runs unbroken out to this far from the access point. */
+export const ACCESS_RUN_M = 200;
+
+/** The scent verdicts of the route judge. A scent problem at the access point is the same on every stand. */
+export const SCENT_REASONS = {
+  foodAvoid: 'Wind carries your scent onto feeding deer.',
+  foodCaution: 'Scent drifts toward the food deer may be on.',
+  bedAvoid: 'Wind carries your scent into bedding here.',
+  bedCaution: 'Scent may reach bedding here.',
+  bedDrift: 'Scent drifts toward bedding here.',
+} as const;
+const SCENT_REASON_SET: ReadonlySet<string> = new Set(Object.values(SCENT_REASONS));
+const FOOD_SCENT_REASONS: ReadonlySet<string> = new Set([SCENT_REASONS.foodAvoid, SCENT_REASONS.foodCaution]);
+
+export const OFF_PROPERTY_REASON = 'Off your property: get permission or mark a different access point.';
+export const HOUSE_BUFFER_REASON = 'Within 50 m of a house: get permission or mark a different access point.';
 
 const COVER_TYPES = new Set(['creek', 'draw', 'road', 'edge']);
 const WALK_PLUME_HALF_DEG = 30;
 const WALK_PLUME_LEN_M = 200;
-/** Food the route judge watches: the same floor the planner's wind gate uses (FOOD_SENSITIVE_MIN). */
-const JUDGE_FOOD_MIN_PROB = 0.3;
 /** Walking scent this close to feeding deer is a red segment; out to the food plume length it's caution. */
 const FOOD_SCENT_AVOID_M = 100;
 
@@ -344,7 +370,16 @@ const NEIGHBORS: Array<[number, number, number]> = [
   [-1, -1, Math.SQRT2],
 ];
 
-export function astar(g: CostGrid, start: Vec, goal: Vec, penalty?: Float64Array): { path: Vec[]; cost: number } | null {
+/**
+ * Cheapest walk from start to goal on the grid.
+ *
+ * Only HARD blocks (water, no-access zones, neighbor lines) are ever impassable. Soft ground
+ * (off the property line, within 50 m of a house) is free to leave or reach within ESCAPE_M of the
+ * truck or the stand and otherwise blocked, unless `relaxSoft` is set: then it is walkable
+ * everywhere at SOFT_CROSSING_COST per meter, so a stand is never "unreachable" just because the
+ * truck is parked a long way outside the line or a farmhouse sits in the only gap.
+ */
+export function astar(g: CostGrid, start: Vec, goal: Vec, penalty?: Float64Array, relaxSoft = false): { path: Vec[]; cost: number } | null {
   const s = cellOf(g, start);
   const t = cellOf(g, goal);
   const n = g.cols * g.rows;
@@ -355,6 +390,7 @@ export function astar(g: CostGrid, start: Vec, goal: Vec, penalty?: Float64Array
   const h = (i: number) => 0.5 * dist(cellCenter(g, i), goalPt);
   const walk = new Float64Array(n);
   for (let i = 0; i < n; i++) walk[i] = g.cost[i] + (penalty ? penalty[i] : 0);
+  if (relaxSoft) for (let i = 0; i < n; i++) if (g.block[i] === BLOCK_SOFT) walk[i] = SOFT_CROSSING_COST + (penalty ? penalty[i] : 0);
   // Parking at the farmhouse or on the road shoulder: let the walk get out (or in) there.
   const reach = Math.max(ESCAPE_M, 3 * g.cell) / g.cell;
   const r = Math.floor(reach);
@@ -368,7 +404,12 @@ export function astar(g: CostGrid, start: Vec, goal: Vec, penalty?: Float64Array
       }
     }
   }
-  // Start and goal cells are always walkable (the stand and the truck are where they are).
+  // Start and goal cells are always walkable (the stand and the truck are where they are). This
+  // deliberately applies to hard-blocked cells too: a stand or an access point sits where the hunter
+  // put it, and the grid is a cell wide, so a start or goal within about one cell of a fence, water
+  // edge or zone can take its last hop across it (a straight run of at most one cell). The stand
+  // inside a no-access zone is rejected before routing (RoutePlanner.plan), so a route never ends in
+  // the zone's interior; only the cell-wide edge fuzz is tolerated here.
   walk[s] = Math.min(g.cost[s], 5) + (penalty ? penalty[s] : 0);
   walk[t] = Math.min(g.cost[t], 5) + (penalty ? penalty[t] : 0);
   const costAt = (i: number) => walk[i];
@@ -484,20 +525,20 @@ export function makeSegmentJudge(ctx: RouteContext, kind: WalkKind): SegmentJudg
         else if (d < sb * 1.5) raise('caution', `Passes ${Math.round(d)} m from bedding.`);
         if (scentReachesArea(p, downwind, half, bed, 150)) {
           // Bedded deer, or bucks returning before light: scent in the bed blows the sit.
-          if (state.bedded >= 0.5 || (bucksReturning && bed.kind === 'buck')) raise('avoid', 'Wind carries your scent into bedding here.');
-          else raise('caution', 'Scent may reach bedding here.');
-        } else if (state.bedded >= 0.5 && scentReachesArea(p, downwind, half, bed, WALK_PLUME_LEN_M)) raise('caution', 'Scent drifts toward bedding here.');
+          if (state.bedded >= 0.5 || (bucksReturning && bed.kind === 'buck')) raise('avoid', SCENT_REASONS.bedAvoid);
+          else raise('caution', SCENT_REASONS.bedCaution);
+        } else if (state.bedded >= 0.5 && scentReachesArea(p, downwind, half, bed, WALK_PLUME_LEN_M)) raise('caution', SCENT_REASONS.bedDrift);
       }
       const atStand = stand !== undefined && dist(p, stand) < STAND_APRON_M;
       for (const food of ctx.habitat.food) {
-        if (food.probability < JUDGE_FOOD_MIN_PROB || atStand) continue;
+        if (food.probability < FOOD_SENSITIVE_MIN || atStand) continue;
         const inside = insideDepth(p, food) > FIELD_EDGE_TOLERANCE_M;
         if (state.onFood >= 0.5) {
           if (inside) raise('avoid', 'Crosses food where deer are likely feeding.');
           else if (distanceToArea(p, food) < FIELD_EDGE_TOLERANCE_M) raise('caution', 'Walks the edge of a field deer may be feeding in.');
           // In the dark deer are on the food: scent blowing onto it busts them as surely as walking it.
-          if (scentReachesArea(p, downwind, half, food, FOOD_SCENT_AVOID_M)) raise('avoid', 'Wind carries your scent onto feeding deer.');
-          else if (scentReachesArea(p, downwind, half, food, WALK_PLUME_LEN_M * 0.75)) raise('caution', 'Scent drifts toward the food deer may be on.');
+          if (scentReachesArea(p, downwind, half, food, FOOD_SCENT_AVOID_M)) raise('avoid', SCENT_REASONS.foodAvoid);
+          else if (scentReachesArea(p, downwind, half, food, WALK_PLUME_LEN_M * 0.75)) raise('caution', SCENT_REASONS.foodCaution);
         } else if (state.daylight && inside) raise('caution', 'Open ground in daylight.');
       }
       if (state.moving >= 0.5 && !atStand) {
@@ -533,7 +574,21 @@ function simplifyAround(points: Vec[], tolerance: number, edges: Array<[Vec, Vec
   return left.slice(0, -1).concat(right);
 }
 
-function assembleRoute(kind: WalkKind, start: AccessStart, path: Vec[], judge: SegmentJudge, ctx: RouteContext, cell: number, barriers: Barriers): Route {
+/** What soft-blocked ground a point is on, if any: off the drawn property line, or inside a house buffer. */
+type SoftGround = NonNullable<RouteSegment['ground']>;
+type SoftGroundAt = (p: Vec) => SoftGround | null;
+
+function makeSoftGroundAt(property: Property): SoftGroundAt {
+  const boundary = property.boundary && property.boundary.length >= 3 ? property.boundary : undefined;
+  const houses = property.features.filter((f) => f.status === 'active' && f.type === 'house');
+  return (p) => {
+    if (boundary && !pointInPolygon(p, boundary)) return 'off_property';
+    if (houses.some((h) => pointGeometryDistance(p, h.geometry) < 50)) return 'house_buffer';
+    return null;
+  };
+}
+
+function assembleRoute(kind: WalkKind, start: AccessStart, path: Vec[], judge: SegmentJudge, ctx: RouteContext, cell: number, barriers: Barriers, softAt: SoftGroundAt | null): Route {
   const points = simplifyAround(path, cell * 0.6, barriers.edges);
   // Re-split long straight runs so the color coding stays meaningful.
   const dense: Vec[] = [points[0]];
@@ -542,13 +597,51 @@ function assembleRoute(kind: WalkKind, start: AccessStart, path: Vec[], judge: S
     for (let k = 1; k <= n; k++) dense.push(lerp(points[i - 1], points[i], k / n));
   }
   const stand = kind === 'entry' ? dense[dense.length - 1] : dense[0];
-  // Judge each short piece, then merge consecutive pieces with the same verdict.
+  // Soft ground is only tolerated by the truck or at the stand; a walk that needs more of it than
+  // that (the router's second pass) gets those stretches flagged red.
+  const apronM = Math.max(ESCAPE_M, 3 * cell);
+  const groundOf = (a: Vec, b: Vec): SoftGround | undefined => {
+    if (!softAt) return undefined;
+    let found: SoftGround | undefined;
+    for (const p of [a, lerp(a, b, 0.5), b]) {
+      if (dist(p, start.position) <= apronM || dist(p, stand) <= apronM) continue;
+      const g = softAt(p);
+      if (g === 'off_property') return g;
+      if (g) found = g;
+    }
+    return found;
+  };
+  // Judge each short piece.
+  const pieces = dense.slice(1).map((b, k) => {
+    const a = dense[k];
+    const ground = groundOf(a, b);
+    const verdict = judge(a, b, stand);
+    const j = ground ? { status: 'avoid' as Status, reason: ground === 'off_property' ? OFF_PROPERTY_REASON : HOUSE_BUFFER_REASON } : verdict;
+    return { a, b, ground, j, atAccess: false };
+  });
+  // A scent problem that begins at the access point and runs on unbroken (the parking spot is upwind
+  // of a field) is the same on every stand that starts there: mark it so the planner can report it
+  // once instead of holding it against each stand.
+  const fromAccess = kind === 'entry' ? pieces : [...pieces].reverse();
+  let inRun = false;
+  for (const piece of fromAccess) {
+    const d = dist(lerp(piece.a, piece.b, 0.5), start.position);
+    const scent = !piece.ground && piece.j.status !== 'safe' && SCENT_REASON_SET.has(piece.j.reason);
+    if (!scent) {
+      if (inRun || d >= ACCESS_ZONE_M) break;
+      continue;
+    }
+    if (!inRun && d >= ACCESS_ZONE_M) break;
+    if (d >= ACCESS_RUN_M) break;
+    inRun = true;
+    piece.atAccess = true;
+  }
+  // Merge consecutive pieces with the same verdict.
   const segments: RouteSegment[] = [];
-  for (let i = 1; i < dense.length; i++) {
-    const j = judge(dense[i - 1], dense[i], stand);
+  for (const { a, b, ground, j, atAccess } of pieces) {
     const last = segments[segments.length - 1];
-    if (last && last.status === j.status && last.reason === j.reason) last.points.push(dense[i]);
-    else segments.push({ points: [dense[i - 1], dense[i]], status: j.status, reason: j.reason });
+    if (last && last.status === j.status && last.reason === j.reason && last.ground === ground && !!last.atAccess === atAccess) last.points.push(b);
+    else segments.push({ points: [a, b], status: j.status, reason: j.reason, ...(ground ? { ground } : {}), ...(atAccess ? { atAccess: true } : {}) });
   }
   const minBed = ctx.habitat.bedding.reduce((m, b) => Math.min(m, ...dense.map((p) => distanceToArea(p, b))), Infinity);
   const worst: Status = segments.some((s) => s.status === 'avoid') ? 'avoid' : segments.some((s) => s.status === 'caution') ? 'caution' : 'safe';
@@ -556,6 +649,8 @@ function assembleRoute(kind: WalkKind, start: AccessStart, path: Vec[], judge: S
   if (start.inferred) notes.push(`Starts at ${start.label.toLowerCase()} (inferred). Mark your parking or access point for better routes.`);
   const boundary = ctx.property.boundary;
   if (boundary && boundary.length >= 3 && dense.some((p) => !pointInPolygon(p, boundary))) notes.push('Part of this walk is outside your property line. Only cross ground you have permission to use.');
+  if (segments.some((s) => s.ground === 'off_property')) notes.push('No walk reaches this stand without crossing ground off your property. Get permission, or mark a different access point.');
+  if (segments.some((s) => s.ground === 'house_buffer')) notes.push('The walk passes within 50 m of a house. Only go that way with the owner’s OK, or mark a different access point.');
   if (kind === 'exit' && ctx.window === 'PM') notes.push('Leave after dark without a headlamp sweep across the field. Use a red light and go slow.');
   if (kind === 'entry' && ctx.window === 'AM') notes.push('Be in the stand 30+ minutes before legal light.');
   if (kind === 'exit' && ctx.window === 'AM') notes.push('Wait for a lull in movement, then climb down quietly.');
@@ -578,9 +673,16 @@ export interface RoutePair {
   noAccess: boolean;
   /**
    * No legal walking route reaches the stand: it sits inside a no-access zone, or water,
-   * a no-access zone or a neighbor line cuts it off from every start point.
+   * a no-access zone or a neighbor line cuts it off from every start point. Only HARD blocks
+   * make a stand unreachable; ground off the property line or near a house never does.
    */
   unreachable: boolean;
+  /**
+   * The walk reaches the stand only by crossing ground off the property line or within 50 m of
+   * a house (beyond the stretch by the truck or the stand). Those stretches are flagged red with a
+   * `ground` on the segment; the stand is a caution, never a no-go for this reason.
+   */
+  softCrossing: boolean;
 }
 
 /** Exit points this close to the stand, the truck or a gate are shared by necessity. */
@@ -607,12 +709,12 @@ interface Leg {
 }
 
 /** Cheapest route from → to, through one of the must-use gates when there are any. */
-function routeVia(g: CostGrid, from: Vec, to: Vec, gates: Vec[], penalty?: Float64Array): Leg | null {
-  if (gates.length === 0) return astar(g, from, to, penalty);
+function routeVia(g: CostGrid, from: Vec, to: Vec, gates: Vec[], penalty?: Float64Array, relaxSoft = false): Leg | null {
+  if (gates.length === 0) return astar(g, from, to, penalty, relaxSoft);
   let best: Leg | null = null;
   for (const gate of gates) {
-    const a = astar(g, from, gate, penalty);
-    const b = a && astar(g, gate, to, penalty);
+    const a = astar(g, from, gate, penalty, relaxSoft);
+    const b = a && astar(g, gate, to, penalty, relaxSoft);
     if (a && b && (!best || a.cost + b.cost < best.cost)) best = { path: [...a.path, ...b.path.slice(1)], cost: a.cost + b.cost };
   }
   return best;
@@ -629,6 +731,7 @@ export function createRoutePlanner(ctx: RouteContext, extraPoints: Vec[] = []): 
   const entryJudge = makeSegmentJudge(ctx, 'entry');
   const exitJudge = makeSegmentJudge(ctx, 'exit');
   const barriers = barriersFor(ctx.property);
+  const softAt = makeSoftGroundAt(ctx.property);
   const gatePoints = barriers.gates.map((g) => g.position);
   // A walk that starts at a gate has already used it.
   const gatesFor = (st: AccessStart) => (gatePoints.some((g) => dist(g, st.position) < 1) ? [] : gatePoints);
@@ -637,15 +740,27 @@ export function createRoutePlanner(ctx: RouteContext, extraPoints: Vec[] = []): 
     plan(stand: Vec): RoutePair {
       const starts = accessStarts(ctx.property, stand);
       // A stand inside a no-access zone is never routed to, however close to the edge it sits.
-      if (barriers.zones.some((z) => pointInPolygon(stand, z))) return { entry: null, exit: null, noAccess: starts.length === 0, unreachable: true };
-      if (starts.length === 0) return { entry: null, exit: null, noAccess: true, unreachable: false };
+      if (barriers.zones.some((z) => pointInPolygon(stand, z))) return { entry: null, exit: null, noAccess: starts.length === 0, unreachable: true, softCrossing: false };
+      if (starts.length === 0) return { entry: null, exit: null, noAccess: true, unreachable: false, softCrossing: false };
 
-      let bestEntry: (Leg & { start: AccessStart }) | null = null;
-      for (const st of starts) {
-        const r = routeVia(entryGrid, st.position, stand, gatesFor(st));
-        if (r && (!bestEntry || r.cost < bestEntry.cost)) bestEntry = { ...r, start: st };
+      // Pass 1 walks only ground the hunter may use. Pass 2 (only when pass 1 finds nothing) also
+      // crosses soft ground, at a steep cost, so a parking spot far outside the line or a farmhouse
+      // in the only gap yields a flagged route rather than a false "no legal route".
+      const findEntry = (relaxSoft: boolean) => {
+        let best: (Leg & { start: AccessStart }) | null = null;
+        for (const st of starts) {
+          const r = routeVia(entryGrid, st.position, stand, gatesFor(st), undefined, relaxSoft);
+          if (r && (!best || r.cost < best.cost)) best = { ...r, start: st };
+        }
+        return best;
+      };
+      let entryRelaxed = false;
+      let bestEntry = findEntry(false);
+      if (!bestEntry) {
+        bestEntry = findEntry(true);
+        entryRelaxed = bestEntry !== null;
       }
-      if (!bestEntry) return { entry: null, exit: null, noAccess: false, unreachable: true };
+      if (!bestEntry) return { entry: null, exit: null, noAccess: false, unreachable: true, softCrossing: false };
 
       // Penalize re-using the entry path on the way out (outside the stand, truck and gate zones).
       const apron = [stand, bestEntry.start.position, ...gatePoints];
@@ -662,14 +777,23 @@ export function createRoutePlanner(ctx: RouteContext, extraPoints: Vec[] = []): 
             if (x >= 0 && y >= 0 && x < exitGrid.cols && y < exitGrid.rows) penalty[y * exitGrid.cols + x] = 4;
           }
       }
-      let bestExit: (Leg & { start: AccessStart }) | null = null;
-      for (const st of starts) {
-        const r = routeVia(exitGrid, stand, st.position, gatesFor(st), penalty);
-        if (r && (!bestExit || r.cost < bestExit.cost)) bestExit = { ...r, start: st };
+      const findExit = (relaxSoft: boolean) => {
+        let best: (Leg & { start: AccessStart }) | null = null;
+        for (const st of starts) {
+          const r = routeVia(exitGrid, stand, st.position, gatesFor(st), penalty, relaxSoft);
+          if (r && (!best || r.cost < best.cost)) best = { ...r, start: st };
+        }
+        return best;
+      };
+      let exitRelaxed = entryRelaxed;
+      let bestExit = findExit(entryRelaxed);
+      if (!bestExit && !entryRelaxed) {
+        bestExit = findExit(true);
+        exitRelaxed = bestExit !== null;
       }
 
-      const entry = assembleRoute('entry', bestEntry.start, bestEntry.path, entryJudge, ctx, entryGrid.cell, barriers);
-      const exit = bestExit ? assembleRoute('exit', bestExit.start, bestExit.path, exitJudge, ctx, exitGrid.cell, barriers) : null;
+      const entry = assembleRoute('entry', bestEntry.start, bestEntry.path, entryJudge, ctx, entryGrid.cell, barriers, entryRelaxed ? softAt : null);
+      const exit = bestExit ? assembleRoute('exit', bestExit.start, bestExit.path, exitJudge, ctx, exitGrid.cell, barriers, exitRelaxed ? softAt : null) : null;
       if (entry && exit && bestExit) {
         // Walking within ~1.5 cells of the entry path is walking the same ground.
         const overlap = sharedFraction(exit.points, entry.points, entryGrid.cell * 1.5, [...apron, bestExit.start.position]);
@@ -677,9 +801,70 @@ export function createRoutePlanner(ctx: RouteContext, extraPoints: Vec[] = []): 
         exit.overlapWithOther = overlap;
         if (overlap > 0.6) exit.notes.push('Terrain forces the exit back along your entry path. Go extra slow and quiet.');
       }
-      return { entry, exit, noAccess: false, unreachable: false };
+      const softCrossing = [entry, exit].some((r) => r?.segments.some((x) => x.ground));
+      return { entry, exit, noAccess: false, unreachable: false, softCrossing };
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// A scent problem at the parking spot is a plan-level fact, not a per-stand one
+// ---------------------------------------------------------------------------
+
+/** A parking spot whose own surroundings put scent on deer, shared by most stands that start there. */
+export interface AccessHazard {
+  /** The access point's label, e.g. "Field gate". */
+  label: string;
+  position: Vec;
+  walks: WalkKind[];
+  /** What the scent reaches. */
+  targets: Array<'food' | 'bedding'>;
+  /** How many stands start here and are hit by it. */
+  stands: number;
+}
+
+/** Which of a stand's walks have their at-access scent stretch discounted (it is reported once, plan-wide). */
+export type SharedAccess = { entry: boolean; exit: boolean };
+
+/** Share of the stands starting at one access point that must hit the same scent problem to call it the parking spot's. */
+const SHARED_ACCESS_FRACTION = 0.6;
+/** Fewer than this many stands is just that stand's problem. */
+const SHARED_ACCESS_MIN_STANDS = 2;
+
+/**
+ * Finds scent problems that sit at an access point and recur on most stands that start there (the
+ * parking spot is upwind of a field). The same stretch is red on every stand and no choice of stand
+ * clears it, so the planner reports it once and does not hold it against any one stand's score or
+ * decision. Hazards that only some stands share stay per-stand.
+ */
+export function findSharedAccessHazards(pairs: readonly RoutePair[]): { hazards: AccessHazard[]; shared: Map<RoutePair, SharedAccess> } {
+  const groups = new Map<string, { kind: WalkKind; label: string; position: Vec; members: Array<{ pair: RoutePair; route: Route }> }>();
+  for (const pair of pairs) {
+    for (const route of [pair.entry, pair.exit]) {
+      if (!route || route.points.length < 2) continue;
+      const position = route.kind === 'entry' ? route.points[0] : route.points[route.points.length - 1];
+      const key = `${route.kind}|${route.startLabel}|${Math.round(position.x / 5)}:${Math.round(position.y / 5)}`;
+      const g = groups.get(key) ?? { kind: route.kind, label: route.startLabel, position, members: [] };
+      g.members.push({ pair, route });
+      groups.set(key, g);
+    }
+  }
+  const shared = new Map<RoutePair, SharedAccess>();
+  const merged = new Map<string, AccessHazard>();
+  for (const g of groups.values()) {
+    const hit = g.members.filter((m) => m.route.segments.some((x) => x.atAccess));
+    if (g.members.length < SHARED_ACCESS_MIN_STANDS || hit.length < SHARED_ACCESS_MIN_STANDS || hit.length / g.members.length < SHARED_ACCESS_FRACTION) continue;
+    for (const m of hit) shared.set(m.pair, { entry: false, exit: false, ...shared.get(m.pair), [g.kind]: true });
+    const targets = new Set<'food' | 'bedding'>();
+    for (const m of hit) for (const x of m.route.segments) if (x.atAccess) targets.add(FOOD_SCENT_REASONS.has(x.reason) ? 'food' : 'bedding');
+    const key = `${g.label}|${Math.round(g.position.x / 5)}:${Math.round(g.position.y / 5)}`;
+    const h = merged.get(key) ?? { label: g.label, position: g.position, walks: [], targets: [], stands: 0 };
+    if (!h.walks.includes(g.kind)) h.walks.push(g.kind);
+    for (const t of targets) if (!h.targets.includes(t)) h.targets.push(t);
+    h.stands = Math.max(h.stands, hit.length);
+    merged.set(key, h);
+  }
+  return { hazards: [...merged.values()], shared };
 }
 
 export function featuresForRouting(features: MapFeature[]): MapFeature[] {

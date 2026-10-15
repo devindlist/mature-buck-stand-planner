@@ -1,69 +1,72 @@
-import * as FileSystem from 'expo-file-system';
 import type { Hunt, Plan, PlanCard, PressureEvent, Property, Sighting, WeatherSnapshot } from '@msp/engine';
 import { getDb, MAPS_DIR } from './database';
+import { ensureMapPhotoFile, deletePropertyPhoto, photoToStore, resolvePhotoUri, toStoredPhotoUri, writePhotoRow } from './mapPhotos';
 
 /** Thin JSON-document repositories over the encrypted SQLite database. */
 
 const parse = <T,>(s: string): T => JSON.parse(s) as T;
 
-// --- Map photo paths -------------------------------------------------------
+// --- Map photos ----------------------------------------------------------
 //
-// iOS can move the app's data container (new UUID in the path) when the app is updated,
-// so an absolute file:// URI saved yesterday may point nowhere today. App-managed photos
-// are stored RELATIVE ('maps/<file>.jpg') and resolved against the current documents
-// directory on every read; old absolute URIs are re-rooted the same way.
+// The photo bytes live in the encrypted database (map_images); the JPEG a screen shows is
+// a cache file that is re-created from the database whenever it is missing (db/mapPhotos.ts).
+// Property.mapImageUri is stored RELATIVE ('maps/<file>.jpg') and resolved against the
+// current cache directory on every read, because iOS can move the app container (new UUID
+// in the path) and the OS can purge the cache. Old absolute URIs are re-rooted the same way.
 
-/** A photo in the app's documents/maps folder under ANY container path (iOS Documents, Android files). */
-const APP_MAPS_PHOTO = /^file:\/\/.*\/(?:Documents|files)\/maps\/([^/]+)$/;
+export { toStoredPhotoUri, resolvePhotoUri, restoreMapPhotoCache } from './mapPhotos';
 
-/** 'maps/<file>' for a photo in the app's maps folder (current or old container path), else the URI unchanged. */
-export function toStoredPhotoUri(uri: string | undefined, documentDirectory: string | null | undefined = FileSystem.documentDirectory): string | undefined {
-  if (!uri || uri.startsWith(MAPS_DIR)) return uri;
-  const docs = documentDirectory ? (documentDirectory.endsWith('/') ? documentDirectory : `${documentDirectory}/`) : null;
-  if (docs && uri.startsWith(`${docs}${MAPS_DIR}`)) return uri.slice(docs.length);
-  const m = APP_MAPS_PHOTO.exec(uri);
-  return m ? `${MAPS_DIR}${m[1]}` : uri;
+/** The property with a displayable photo URI (file re-created from the database if it was purged). */
+async function withPhoto(p: Property): Promise<Property> {
+  return p.mapImageUri ? { ...p, mapImageUri: await ensureMapPhotoFile(p.id, p.mapImageUri) } : p;
 }
-
-/** Absolute file:// URI under the CURRENT documents directory for a stored photo path. */
-export function resolvePhotoUri(uri: string | undefined, documentDirectory: string | null | undefined = FileSystem.documentDirectory): string | undefined {
-  const stored = toStoredPhotoUri(uri, documentDirectory);
-  if (!stored || !documentDirectory || !stored.startsWith(MAPS_DIR)) return uri;
-  return `${documentDirectory.endsWith('/') ? documentDirectory : `${documentDirectory}/`}${stored}`;
-}
-
-const withResolvedPhoto = (p: Property): Property => (p.mapImageUri ? { ...p, mapImageUri: resolvePhotoUri(p.mapImageUri) } : p);
 
 // --- Properties -----------------------------------------------------------
 
 export async function listProperties(): Promise<Property[]> {
   const db = await getDb();
   const rows = await db.getAllAsync<{ data: string }>('SELECT data FROM properties ORDER BY updated_at DESC');
-  return rows.map((r) => withResolvedPhoto(parse<Property>(r.data)));
+  const out: Property[] = [];
+  for (const r of rows) out.push(await withPhoto(parse<Property>(r.data))); // one at a time: a photo is several MB of text
+  return out;
 }
 
 export async function getProperty(id: string): Promise<Property | null> {
   const db = await getDb();
   const row = await db.getFirstAsync<{ data: string }>('SELECT data FROM properties WHERE id = ?', id);
-  return row ? withResolvedPhoto(parse<Property>(row.data)) : null;
+  return row ? withPhoto(parse<Property>(row.data)) : null;
 }
 
-/** Saves the photo path relative to the documents directory; returns the property with it resolved. */
+/**
+ * Saves the property. Its map photo goes into the encrypted database in the same
+ * transaction (read from the file on first save; later saves of the same photo skip it);
+ * the stored property keeps only the relative path. Returns the property with the photo
+ * resolved to a displayable file:// URI.
+ */
 export async function saveProperty(p: Property): Promise<Property> {
   const db = await getDb();
   const next = { ...p, updatedAt: new Date().toISOString() };
-  const stored = next.mapImageUri ? { ...next, mapImageUri: toStoredPhotoUri(next.mapImageUri) } : next;
-  await db.runAsync('INSERT OR REPLACE INTO properties (id, name, updated_at, data) VALUES (?, ?, ?, ?)', next.id, next.name, next.updatedAt, JSON.stringify(stored));
-  return withResolvedPhoto(next);
+  const storedUri = toStoredPhotoUri(next.mapImageUri);
+  const photo = storedUri?.startsWith(MAPS_DIR) ? await photoToStore(db, next.id, storedUri, next.mapImageUri) : null;
+  const stored = storedUri !== next.mapImageUri ? { ...next, mapImageUri: storedUri } : next;
+  await db.withTransactionAsync(async () => {
+    if (photo) await writePhotoRow(db, next.id, photo);
+    await db.runAsync('INSERT OR REPLACE INTO properties (id, name, updated_at, data) VALUES (?, ?, ?, ?)', next.id, next.name, next.updatedAt, JSON.stringify(stored));
+  });
+  return next.mapImageUri ? { ...next, mapImageUri: resolvePhotoUri(next.mapImageUri) } : next;
 }
 
 export async function deleteProperty(id: string): Promise<void> {
   const db = await getDb();
+  const row = await db.getFirstAsync<{ data: string }>('SELECT data FROM properties WHERE id = ?', id);
+  const photoUri = row ? parse<Property>(row.data).mapImageUri : undefined;
   await db.withTransactionAsync(async () => {
     for (const t of ['properties', 'plans', 'hunts', 'sightings', 'pressure_events']) {
       await db.runAsync(`DELETE FROM ${t} WHERE ${t === 'properties' ? 'id' : 'property_id'} = ?`, id);
     }
+    await db.runAsync('DELETE FROM map_images WHERE property_id = ?', id);
   });
+  await deletePropertyPhoto(db, id, photoUri).catch(() => undefined);
 }
 
 // --- Plans ---------------------------------------------------------------

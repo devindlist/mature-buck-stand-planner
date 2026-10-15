@@ -50,6 +50,13 @@ const DEFAULT_RADIUS_M = 60;
  */
 export const BEDDING_MIN_PROB = 0.25;
 
+/**
+ * Food at least this likely to be fed in this sit is a hard wind-gate area and is watched by the
+ * route judge. One constant for both (planner.ts wind gate, stands/routes.ts segment judge), so a
+ * field the gate protects is also a field the walk is judged against.
+ */
+export const FOOD_SENSITIVE_MIN = 0.3;
+
 function polygonRadius(points: Vec[]): number {
   return Math.max(25, Math.sqrt(polygonArea(points) / Math.PI));
 }
@@ -359,7 +366,9 @@ export function inferCorridors(features: MapFeature[], bedding: BeddingArea[], f
 
   // Bed → food: the bread-and-butter pattern outside the rut.
   for (const b of bedding) {
-    if (b.probability < 0.35) continue;
+    // Every bed the wind gate protects also gets bed → food travel (a bed the gate guards but that
+    // makes no travel would hide the very trail the hunter's scent is being kept off).
+    if (b.probability < BEDDING_MIN_PROB) continue;
     const foods = food
       .map((f) => ({ f, d: dist(b.center, f.center) }))
       .filter((x) => x.d <= 1600)

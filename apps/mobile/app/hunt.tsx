@@ -1,10 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Alert, Pressable, ScrollView, Text, View } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
-import { compass16, downwindBearing, type Decision, type Maturity, type Plan, type PlanCard, type Sighting, type StandRecommendation, type WeatherSnapshot } from '@msp/engine';
+import { compass16, downwindBearing, type Decision, type Maturity, type Plan, type PlanCard, type Sighting, type SightingBehavior, type StandRecommendation, type WeatherSnapshot } from '@msp/engine';
 import { useAppStore, type HuntSession } from '../src/state/store';
 import { useTheme } from '../src/theme/ThemeContext';
-import { BigButton, Screen, StatusChip } from '../src/components/ui';
+import { BigButton, Chip, Screen, Stepper, StatusChip } from '../src/components/ui';
 import { StatusIcon } from '../src/components/Icons';
 import { getPlan, saveSighting } from '../src/db/repos';
 import { emergencyMessage, OVERDUE_GRACE_MIN, textEmergencyContact } from '../src/services/checkin';
@@ -31,12 +31,30 @@ const SIGHTINGS: Array<{ m: Maturity; label: string }> = [
   { m: 'unknown', label: 'Other deer' },
 ];
 
+/** Optional detail the hunter can add to the sighting they just logged (the one-tap log stays one tap). */
+const BEHAVIORS: Array<{ b: SightingBehavior; label: string }> = [
+  { b: 'feeding', label: 'Feeding' },
+  { b: 'traveling', label: 'Walking' },
+  { b: 'bedded', label: 'Bedded' },
+  { b: 'chasing', label: 'Chasing' },
+  { b: 'scraping', label: 'Scraping' },
+  { b: 'rubbing', label: 'Rubbing' },
+];
+
 const WIND_DIRS = [0, 45, 90, 135, 180, 225, 270, 315];
 /** A tapped "wind at the tree" stays authoritative this long. */
 const OBSERVED_WIND_TTL_MIN = 180;
 
 type DialStatus = 'good' | 'caution' | 'bad';
 const RANK: Record<DialStatus, number> = { good: 0, caution: 1, bad: 2 };
+
+/**
+ * Red light is forced on while any Hunt screen is mounted and put back to what it was
+ * before the first one. Counting screens keeps a second instance (a notification tap, a
+ * "keep hunting" replace) from switching it off when the other one goes away.
+ */
+let huntScreens = 0;
+let redLightBeforeHunt = false;
 
 const allRecs = (plan: Plan): StandRecommendation[] => [...plan.recommendations, ...(plan.backup ? [plan.backup] : []), ...(plan.yourStands ?? [])];
 
@@ -82,6 +100,8 @@ export default function HuntMode() {
   const set = useAppStore((s) => s.set);
   const [now, setNow] = useState(Date.now());
   const [lastLog, setLastLog] = useState<string | null>(null);
+  const [lastSighting, setLastSighting] = useState<Sighting | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
   const [sessionPlan, setSessionPlan] = useState<{ plan: Plan; card: PlanCard } | null>(null);
   const [planMissing, setPlanMissing] = useState(false);
   const [live, setLive] = useState<{ snapshot: WeatherSnapshot; offline: boolean; fetchedAt: number } | null>(null);
@@ -94,10 +114,13 @@ export default function HuntMode() {
   // The hunter asked to hunt a different stand (or a newer plan) than the active session's.
   const switching = !!(hunt && requested && storePlan && (hunt.standId !== requested || hunt.planId !== storePlan.plan.id));
 
-  // Red light on while hunting; restore on exit.
+  // Red light on while hunting; back to the hunter's own setting on exit.
   useEffect(() => {
+    if (huntScreens++ === 0) redLightBeforeHunt = useAppStore.getState().redLight;
     set({ redLight: true });
-    return () => set({ redLight: false });
+    return () => {
+      if (--huntScreens === 0) set({ redLight: redLightBeforeHunt });
+    };
   }, [set]);
 
   // The active session's own plan, when it isn't the latest one in memory (replan, restart).
@@ -152,12 +175,14 @@ export default function HuntMode() {
     return () => clearInterval(id);
   }, []);
 
-  // Battery-aware wind refresh for THIS hunt's property, date and window.
+  // Battery-aware wind refresh for THIS hunt's date and window. The location is the plan's
+  // own (set on every plan, including photo-only maps planned from GPS or an approximate
+  // spot); a geo-referenced map's origin is only the fallback for an older plan.
   const refreshWind = useCallback(async () => {
-    const origin = property?.calibration?.originGeo;
-    if (!plan || !property || !origin) return;
+    const loc = plan?.inputs.location ?? property?.calibration?.originGeo;
+    if (!plan || !property || !loc) return;
     try {
-      const r = await loadForecast(origin, plan.inputs.date, plan.inputs.window, property.stateCode, plan.inputs.phaseOverride);
+      const r = await loadForecast(loc, plan.inputs.date, plan.inputs.window, property.stateCode, plan.inputs.phaseOverride);
       setLive({ snapshot: r.snapshot, offline: r.status === 'offline', fetchedAt: Date.now() });
       // Keep the global wind badge in step, but only when it shows this same sit.
       const s = useAppStore.getState();
@@ -169,17 +194,23 @@ export default function HuntMode() {
     }
   }, [plan, property, set]);
   useEffect(() => {
-    let timer: ReturnType<typeof setTimeout>;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     let alive = true;
     const loop = async () => {
-      await refreshWind();
-      const min = await windPollMinutes();
-      if (alive) timer = setTimeout(loop, min * 60_000);
+      try {
+        await refreshWind();
+      } catch {
+        /* a failed refresh keeps the plan's wind on screen; the next poll tries again */
+      } finally {
+        // Whatever happened, schedule the next poll: one failure must not end the wind check.
+        const min = await windPollMinutes().catch(() => 30);
+        if (alive) timer = setTimeout(() => void loop(), min * 60_000);
+      }
     };
     void loop();
     return () => {
       alive = false;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
     };
   }, [refreshWind]);
 
@@ -267,9 +298,24 @@ export default function HuntMode() {
     };
     try {
       await saveSighting(s);
+      setLastSighting(s);
+      setDetailOpen(false);
       setLastLog(`${SIGHTINGS.find((x) => x.m === m)?.label} logged ${fmtTime(s.at)}`);
     } catch {
       setLastLog('Could not save that sighting. Try again.');
+    }
+  };
+
+  /** Adds detail to the sighting just logged (same record, saved again). */
+  const detailSighting = async (patch: Partial<Pick<Sighting, 'behavior' | 'headingDeg' | 'count'>>) => {
+    if (!lastSighting) return;
+    tap(settings.haptics);
+    const next: Sighting = { ...lastSighting, ...patch };
+    try {
+      await saveSighting(next);
+      setLastSighting(next);
+    } catch {
+      setLastLog('Could not save that detail. Try again.');
     }
   };
 
@@ -417,6 +463,28 @@ export default function HuntMode() {
           ))}
         </View>
         {lastLog ? <Text style={{ color: t.textDim, marginTop: 6 }}>✓ {lastLog}</Text> : null}
+        {lastSighting ? (
+          detailOpen ? (
+            <View style={{ marginTop: 8, borderRadius: RADIUS, borderWidth: 1, borderColor: t.border, padding: 12 }}>
+              <Text style={{ color: t.textDim, fontSize: font.sm }}>What was it doing? (optional)</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                {BEHAVIORS.map((x) => (
+                  <Chip key={x.b} label={x.label} selected={lastSighting.behavior === x.b} onPress={() => void detailSighting({ behavior: lastSighting.behavior === x.b ? 'unknown' : x.b })} style={{ width: '31%' }} />
+                ))}
+              </View>
+              <Text style={{ color: t.textDim, fontSize: font.sm, marginTop: 8 }}>Which way was it heading?</Text>
+              <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 4 }}>
+                {WIND_DIRS.map((d) => (
+                  <Chip key={d} label={compass16(d)} accessibilityLabel={`Heading ${compass16(d)}`} selected={lastSighting.headingDeg === d} onPress={() => void detailSighting({ headingDeg: lastSighting.headingDeg === d ? undefined : d })} style={{ width: '23%' }} />
+                ))}
+              </View>
+              <Stepper label="How many" value={lastSighting.count} onChange={(v) => void detailSighting({ count: v })} min={1} max={20} />
+              <BigButton label="Done" kind="secondary" onPress={() => setDetailOpen(false)} />
+            </View>
+          ) : (
+            <BigButton label="Add detail (what, which way, how many)" kind="ghost" onPress={() => setDetailOpen(true)} />
+          )
+        ) : null}
 
         {/* Check-in timer */}
         <View style={{ marginTop: SPACE, borderRadius: RADIUS, borderWidth: 2, borderColor: overdue || notArmed ? t.status.avoid : t.border, padding: 12 }}>

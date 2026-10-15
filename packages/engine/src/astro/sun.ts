@@ -123,17 +123,37 @@ export function sunTimes(date: ISODate, lat: number, lon: number): SunTimes {
   };
 }
 
+/** Legal shooting hours default to 30 min before sunrise and 30 min after sunset (many Midwest states). */
+export const DEFAULT_LEGAL_MINUTES = 30;
+/** The hunter can set 0..60 minutes; anything else is clamped (a typo must not move legal light by hours). */
+export const MAX_LEGAL_MINUTES = 60;
+
+/** A usable legal-light offset: default for a missing or non-numeric value, otherwise clamped to 0..60. */
+export function legalMinutes(v: number | undefined): number {
+  return typeof v === 'number' && Number.isFinite(v) ? Math.min(MAX_LEGAL_MINUTES, Math.max(0, Math.round(v))) : DEFAULT_LEGAL_MINUTES;
+}
+
 /**
  * Legal shooting hours. Most Midwest states use 30 minutes before sunrise to
- * 30 minutes after sunset for deer, but rules vary by state, weapon and season.
+ * 30 minutes after sunset for deer, but rules vary by state, weapon and season, so the
+ * offsets are the hunter's own setting (PlanInputs.legalMinutesBefore / legalMinutesAfter).
+ * `fromSetting` words the rule as the hunter's choice instead of the typical default.
  * The UI always pairs this with a "verify your state regulations" reminder.
  */
-export function legalHours(sun: SunTimes, minutesBefore = 30, minutesAfter = 30): LegalHours {
+export function legalHours(sun: SunTimes, minutesBefore: number = DEFAULT_LEGAL_MINUTES, minutesAfter: number = DEFAULT_LEGAL_MINUTES, fromSetting = false): LegalHours {
+  const before = legalMinutes(minutesBefore);
+  const after = legalMinutes(minutesAfter);
   return {
-    start: new Date(Date.parse(sun.sunrise) - minutesBefore * 60_000).toISOString(),
-    end: new Date(Date.parse(sun.sunset) + minutesAfter * 60_000).toISOString(),
-    rule: `${minutesBefore} min before sunrise to ${minutesAfter} min after sunset (typical, so verify your state's rules)`,
+    start: new Date(Date.parse(sun.sunrise) - before * 60_000).toISOString(),
+    end: new Date(Date.parse(sun.sunset) + after * 60_000).toISOString(),
+    rule: fromSetting ? `${before} min before sunrise to ${after} min after sunset: your setting` : `${before} min before sunrise to ${after} min after sunset (typical, so verify your state's rules)`,
   };
+}
+
+/** Legal hours for a plan: the hunter's setting when the inputs carry one, else the typical 30/30. */
+export function legalHoursFor(sun: SunTimes, inputs: { legalMinutesBefore?: number; legalMinutesAfter?: number }): LegalHours {
+  const set = inputs.legalMinutesBefore !== undefined || inputs.legalMinutesAfter !== undefined;
+  return legalHours(sun, inputs.legalMinutesBefore, inputs.legalMinutesAfter, set);
 }
 
 export const addMinutes = (iso: string, minutes: number): string => new Date(Date.parse(iso) + minutes * 60_000).toISOString();
