@@ -5,6 +5,7 @@ import { planCardText } from '@msp/engine';
 import { useAppStore } from '../src/state/store';
 import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Disclaimer, Label, Screen, StatusChip } from '../src/components/ui';
+import { confirmHunt, huntGate, NO_GO_SUBLABEL } from '../src/services/huntGate';
 import { font, RADIUS, SPACE } from '../src/theme/theme';
 
 /**
@@ -24,17 +25,12 @@ export default function PlanCardScreen() {
   // Hunt the stand the hunter picked on Results (else the #1), under the same go/no-go rules.
   const huntable = [...plan.recommendations, ...(plan.backup ? [plan.backup] : []), ...(plan.yourStands ?? [])];
   const target = huntable.find((r) => r.stand.id === selectedStandId) ?? huntable[0];
-  const noGoReasons = target ? [...new Set([plan.weatherDecision, target.decision].filter((d) => d.status === 'no_go').flatMap((d) => d.reasons))] : [];
-  const noGo = !!target && (plan.weatherDecision.status === 'no_go' || target.decision.status === 'no_go');
+  // The same go / no-go rule and confirmation as the Results card (services/huntGate.ts).
+  const gate = huntGate(target, plan.weatherDecision);
+  const noGo = !!target && gate.noGo;
   const startHunt = () => {
     if (!target) return;
-    const go = () => router.push({ pathname: '/hunt', params: { standId: target.stand.id } });
-    if (!noGo) return go();
-    // Never override the hunter, but never let a no-go slip by unread either.
-    Alert.alert(`NO-GO at ${target.stand.name} today`, noGoReasons.join('\n') || 'Conditions make this sit a no-go.', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'I understand, start anyway', style: 'destructive', onPress: go },
-    ]);
+    confirmHunt(gate, target.stand.name, () => router.push({ pathname: '/hunt', params: { standId: target.stand.id } }));
   };
 
   const share = async () => {
@@ -81,6 +77,11 @@ export default function PlanCardScreen() {
             </View>
             <StatusChip status={s.status} />
             {s.backupNote ? <Text style={{ color: t.accent, fontSize: font.md, marginTop: 4 }}>{s.backupNote}</Text> : null}
+            {s.assumedWind ? (
+              <Text style={{ color: t.status.caution, fontSize: font.md, fontWeight: '800', marginTop: 4 }}>
+                ! If wind is {s.assumedWind}: the dial and routes below assume it. This is the plan for a wind shift, not today’s forecast.
+              </Text>
+            ) : null}
             <Text style={{ color: t.text, fontSize: font.md, marginTop: 6 }}>{s.reason}</Text>
             <Row k="Sit" v={s.sitWindow} />
             <Row k="Good winds" v={s.goodWinds} />
@@ -121,7 +122,7 @@ export default function PlanCardScreen() {
           label="Start Hunt mode"
           kind={noGo ? 'danger' : 'primary'}
           disabled={!target}
-          sublabel={target ? `${target.isBackup ? 'Backup' : (plan.yourStands ?? []).includes(target) ? 'Your stand' : `#${target.rank}`}: ${target.stand.name}${noGo ? ' · NO-GO today' : ''}` : 'No stand passed the plan'}
+          sublabel={target ? `${target.isBackup ? 'Backup' : (plan.yourStands ?? []).includes(target) ? 'Your stand' : `#${target.rank}`}: ${target.stand.name}${noGo ? ` · ${NO_GO_SUBLABEL}` : ''}` : 'No stand passed the plan'}
           onPress={startHunt}
         />
       </ScrollView>

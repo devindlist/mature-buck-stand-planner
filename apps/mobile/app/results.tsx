@@ -3,6 +3,7 @@ import { Alert, FlatList, Pressable, Text, useWindowDimensions, View, type ViewT
 import { Redirect, router } from 'expo-router';
 import { compass16, geoToLocal, pixelToLocal, type LatLon, type PixelPoint, type Plan, type PlanInputs, type Property, type Stand, type StandRecommendation, type Vec } from '@msp/engine';
 import { useAppStore, type PlanDraft } from '../src/state/store';
+import { useForecastFreshness } from '../src/state/useForecast';
 import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Screen, Segmented } from '../src/components/ui';
 import { PhotoMap, type MapStand } from '../src/components/PhotoMap';
@@ -47,6 +48,7 @@ export default function Results() {
   const property = useAppStore((s) => s.properties.find((p) => p.id === s.plan?.plan.propertyId) ?? null);
   const draft = useAppStore((s) => s.draft);
   const liveWeather = useAppStore((s) => s.weather);
+  const fresh = useForecastFreshness();
   const selectedStandId = useAppStore((s) => s.selectedStandId);
   const set = useAppStore((s) => s.set);
   const upsertProperty = useAppStore((s) => s.upsertProperty);
@@ -106,7 +108,8 @@ export default function Results() {
       saved = await saveProperty(next);
       upsertProperty(saved);
       const i = plan.inputs;
-      const result = await runPlan(saved, draftFromInputs(i), i.weather, i.location);
+      // Same sit, same legal-light offsets as the plan on screen (not whatever Settings says now).
+      const result = await runPlan(saved, draftFromInputs(i), i.weather, i.location, { legalMinutesBefore: i.legalMinutesBefore, legalMinutesAfter: i.legalMinutesAfter });
       const nextRecs = recsOf(result.plan);
       const keep = focusId && nextRecs.some((r) => r.stand.id === focusId) ? focusId : (nextRecs[0]?.stand.id ?? null);
       focusAfterReplan.current = keep;
@@ -183,10 +186,13 @@ export default function Results() {
 
   const banner = plan.warnings.find((w) => w.level === 'no_go') ?? plan.warnings.find((w) => w.level === 'caution');
 
-  // The wind arrow at top right follows the Plan screen; this plan was made with its own wind.
+  // The wind arrow at top right shows this plan's own wind here (WindBadge follows the plan on
+  // Results). If the Plan screen has since moved on for the SAME sit, say so: planning again would
+  // use that newer wind. A draft for another date or window is a different question; no warning.
   const planWind = plan.inputs.weather;
-  const badgeFrom = draft.overrides.windFromDeg ?? liveWeather?.windFromDeg;
-  const windMoved = badgeFrom !== undefined && compass16(badgeFrom) !== compass16(planWind.windFromDeg);
+  const sameSit = draft.date === plan.inputs.date && draft.window === plan.inputs.window;
+  const newerFrom = !sameSit ? undefined : (draft.overrides.windFromDeg ?? (fresh.current && !fresh.loading && liveWeather && !liveWeather.placeholder ? liveWeather.windFromDeg : undefined));
+  const windMoved = newerFrom !== undefined && compass16(newerFrom) !== compass16(planWind.windFromDeg);
   const assumed = selected?.assumedWindFromDeg;
 
   return (
@@ -281,7 +287,7 @@ export default function Results() {
         <View style={{ flexDirection: 'row', gap: 6, alignItems: 'center', paddingHorizontal: SPACE, paddingTop: 2 }}>
           <StatusIcon status="caution" color={t.status.caution} size={16} />
           <Text style={{ color: t.status.caution, fontSize: font.xs, fontWeight: '700', flex: 1 }}>
-            The wind badge now shows {compass16(badgeFrom!)}; this plan used {compass16(planWind.windFromDeg)}. Plan again to use the newer wind.
+            Plan Hunt now has wind from {compass16(newerFrom!)}; this plan used {compass16(planWind.windFromDeg)}. Plan again to use the newer wind.
           </Text>
         </View>
       ) : null}
@@ -309,6 +315,7 @@ export default function Results() {
               title={isYours(item) ? `Your stand · ${item.stand.name}` : undefined}
               width={cardW}
               busy={busy}
+              weatherDecision={plan.weatherDecision}
               onScorePress={(key) => setSheet({ rec: item, key })}
               onMove={() => {
                 if (!replanning.current) setMoving(item);

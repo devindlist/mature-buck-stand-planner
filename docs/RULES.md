@@ -1,6 +1,6 @@
 # Rules engine
 
-`packages/engine` is a pure TypeScript module with no React Native imports and no runtime dependencies. It runs identically on the phone, in Node, and in tests (`npm test`, 101 tests via `node:test`). Every number below is a named constant in the source, so tuning is a one-line change with a failing or passing test next to it.
+`packages/engine` is a pure TypeScript module with no React Native imports and no runtime dependencies. It runs identically on the phone, in Node, and in tests (`npm test`, 165 tests via `node:test`). Every number below is a named constant in the source, so tuning is a one-line change with a failing or passing test next to it.
 
 Conventions: local planar meters (x = east, y = north); bearings clockwise from true north; wind is meteorological (the direction it blows **from**); times are UTC ISO strings.
 
@@ -26,7 +26,9 @@ The vision model returns normalized photo coordinates with confidence. `parseVis
 
 - **3DEP**: ridge/draw/creek profiles 60 m either side (≥ 1.5 m relief); saddle = higher along the ridge and lower across it; bench = flat shelf with steeper ground above and below.
 - **NLCD**: thick cover / ag / mast / water against land-cover class.
-- **CDL**: crop from last year's layer, with Midwest corn↔soy rotation applied ("CDL showed corn, so rotation suggests beans this year. Confirm.").
+- **CDL**: the crop *family* (corn or soybeans) from last year's layer with the Midwest rotation applied ("CDL showed corn, so rotation suggests beans this year. Confirm."). The growth stage is never frozen: food value follows the date and phase at plan time, and a crop the hunter sets by hand always wins.
+
+A lookup that fails (timeout, offline, server error) is a failure, not "no data": the elevation grid is sampled with bounded concurrency under a deadline, a grid with failed samples is used for that plan only (never cached), and planning proceeds without terrain after about 12 s. Centroids sent to USGS/MRLC/GMU are snapped to a 30 m grid.
 
 Agreement adds +0.15 confidence; disagreement subtracts 0.25. Nothing is deleted. User-placed features are never touched.
 
@@ -38,7 +40,7 @@ Agreement adds +0.15 confidence; disagreement subtracts 0.25. Nothing is deleted
 
 ## 4. Candidates (`stands/candidates.ts`)
 
-Anchors: every pinch point; for bed→food, the bedding-side intercept (setback + 40 m), 70% toward food, and (PM early/late/post-rut) the field edge. Stands are offset 50% of effective range (15–90 m) to the **downwind side** of the corridor (both sides if the wind is within ~15° of parallel). Rejected: inside the setback, outside the boundary, within 10 m of a trail, in water, within 50 m of a road/house, or > 20 m into an open field. Spots the hunter dismissed are never proposed again. The hunter's own stands are always evaluated.
+Anchors: every pinch point; for bed→food, the bedding-side intercept (setback + 40 m), 70% toward food, and (PM early/late/post-rut) the field edge. Stands are offset 50% of effective range (15–90 m) to the **downwind side** of the corridor (both sides if the wind is within ~15° of parallel). Rejected: inside the setback of any bedding at or above the shared floor (`BEDDING_MIN_PROB` = 0.25, the same floor the wind gate and route judge use), outside the boundary, inside a no-access zone, within 10 m of a trail, in water, within 50 m of a road/house, or > 20 m into an open field. Spots the hunter dismissed are never proposed again. The hunter's own stands are always evaluated.
 
 ## 5. Wind gate (`wind/scent.ts`). Hard elimination.
 
@@ -75,8 +77,21 @@ Top 3 by score, at least 100 m apart (if the wind leaves fewer distinct setups, 
 
 ## 8. Low-confidence modifiers (`modifiers/modifiers.ts`)
 
-Moon (±0.25: bright moon nudges AM, dark moon nudges PM) and pressure trend (rising after a front +0.25 to +0.5; sharply falling +0.4). Combined cap ±0.75, inside the 5-point weather bucket, always tagged "low confidence". **Observed data outranks them**: with sightings near the stand they are damped to 25%, and the "why" text says so.
+Moon (±0.25: bright moon nudges AM, dark moon nudges PM), pressure trend (rising after a front +0.25 to +0.5; sharply falling +0.4) and cloud cover (heavy overcast, ≥ 75%, +0.2 AM / +0.3 PM; unknown cloud is no modifier). Combined cap ±0.75, inside the 5-point weather bucket, always tagged "low confidence". **Observed data outranks them**: with sightings near the stand they are damped to 25%, and the "why" text says so.
 
 ## 9. Safety (`safety/safety.ts`)
 
-Weather NO-GO: thunderstorm, freezing rain, gusts ≥ 35 mph, wind chill ≤ −15°F. CAUTION: sleet, gusts ≥ 25, wind chill ≤ 5°F, ≥ 85°F. Shot lanes: 8 × 45° sectors; any sector reaching a road or house within the weapon's danger distance (bow 150, crossbow 200, shotgun 800, muzzleloader/handgun/rifle 1000 yds) is no-shot. Harness and haul-line reminders on every stand. Legal hours default to 30 min before sunrise to 30 min after sunset, always paired with "verify your state's rules".
+Weather NO-GO: thunderstorm, freezing rain, gusts ≥ 35 mph, wind chill ≤ −15°F. CAUTION: sleet, gusts ≥ 25, wind chill ≤ 5°F, ≥ 85°F. Shot lanes: 8 × 45° sectors; any sector reaching a road or house within the weapon's danger distance (bow 150, crossbow 200, shotgun 800, muzzleloader/handgun/rifle 1000 yds) is no-shot. Harness and haul-line reminders on every stand. Legal hours are the hunter's own setting (Settings: minutes before sunrise / after sunset, 0–60, default 30/30), and the plan says when they are "your setting"; they are always paired with "verify your state's rules". Weather gates look at the **worst hour of the sit window** (hourly gusts, temperature, precipitation), not just the midpoint.
+
+## 10. Access and routing (`stands/routes.ts`)
+
+Entry and exit are routed separately on a cost grid shaped by where deer are for that walk (AM in: on food; AM out and PM in: bedded; PM out: on food), and judged segment by segment (safe / caution / avoid, always with a reason).
+
+- **Hard blocks** (water, no-access zones, neighbor lines) are never crossed. A stand cut off by them, or placed inside a no-access zone, is **unreachable**: access scores 0/20, it carries a severity-3 risk and is NO-GO. The hunter's own stands are still listed, with the reason.
+- **Soft blocks** (ground off the drawn property line, house buffers) are costly but crossable. Parking right at a farmhouse or just outside the line works normally; when a walk can only be made across soft ground, the route is built across it, the off-property segments are flagged, the stand gets a "get permission or mark a different access point" risk and a CAUTION (never a silent GO, never a wall of NO-GO).
+- Scent onto feeding deer is flagged on AM-entry and PM-exit walks: avoid within 100 m, caution to 150 m. A parking spot that is itself upwind of a field is reported once as a plan-level warning (with what to do), not repeated as a penalty on every stand.
+- The start and goal cells are always walkable (the truck and the tree are where they are), so the first and last hop can cross a fence or zone edge when they sit within about one cell of it. A stand inside a zone is rejected before routing.
+
+## 11. Rankings and backups
+
+A stand that is NO-GO never ranks above a huntable one. A wind-shift backup ("Only if the wind shifts to X") is evaluated entirely for that assumed wind (dial, plumes, routes, reason all say "if wind is X"), is never marked GO, and prefers the shift the forecast actually shows over an arbitrary one.

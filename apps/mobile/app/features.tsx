@@ -26,6 +26,7 @@ import { useAppStore } from '../src/state/store';
 import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Body, Chip, Label, Screen } from '../src/components/ui';
 import { PhotoMap } from '../src/components/PhotoMap';
+import { StatusIcon } from '../src/components/Icons';
 import { saveProperty } from '../src/db/repos';
 import { uid } from '../src/utils/format';
 import { font, SPACE, TOUCH } from '../src/theme/theme';
@@ -74,11 +75,11 @@ const SHAPE_ADDS: AddSpec[] = [
 
 const BOUNDARY: AddSpec = { key: 'boundary', label: 'Property boundary', target: 'boundary', shape: 'polygon', noun: 'property boundary' };
 
-/** Every crop the engine understands. 'corn' and 'soybeans' mean the crop is known but its stage is not. */
+/** Every crop the engine understands. 'corn' and 'soybeans' mean the crop is known and the engine works out its stage from the date. */
 const CROPS: CropType[] = ['unknown', 'corn', 'soybeans', 'corn_standing', 'corn_picked', 'soybeans_green', 'soybeans_standing', 'soybeans_cut', 'alfalfa_clover', 'winter_wheat', 'brassicas'];
 const CROP_LABEL: Partial<Record<CropType, string>> = {
-  corn: 'corn (stage unknown)',
-  soybeans: 'soybeans (stage unknown)',
+  corn: 'corn (stage by date)',
+  soybeans: 'soybeans (stage by date)',
 };
 
 const CONSTRAINT_LABEL: Record<AccessConstraint['kind'], string> = {
@@ -121,6 +122,8 @@ export default function Features() {
     );
   }
   const cal = property.calibration;
+  /** Mock analysis: every "detected" feature is the made-up sample farm, not something found in the photo. */
+  const mock = property.analysisMode === 'mock';
   const cameras = property.cameras ?? [];
   const constraints = property.accessConstraints ?? [];
   const selStand = property.stands.find((s) => s.id === selected) ?? null;
@@ -251,6 +254,20 @@ export default function Features() {
 
   return (
     <Screen title={`${property.name} map`} onBack={() => router.back()} scroll={false}>
+      {mock ? (
+        <View
+          accessible
+          accessibilityRole="alert"
+          accessibilityLabel="Sample data. These map features are a demo, not detected from your photo."
+          style={{ backgroundColor: t.surfaceAlt, borderBottomWidth: 2, borderBottomColor: t.status.caution, paddingHorizontal: SPACE, paddingVertical: 6, flexDirection: 'row', alignItems: 'center', gap: 8 }}
+        >
+          <StatusIcon status="caution" color={t.status.caution} size={22} />
+          <Text style={{ color: t.status.caution, fontSize: font.sm, fontWeight: '900' }}>SAMPLE DATA</Text>
+          <Text style={{ color: t.text, fontSize: font.xs, flex: 1 }} numberOfLines={2}>
+            Made-up features, not found in your photo. Move, retype or dismiss them, and add what is really on your ground.
+          </Text>
+        </View>
+      ) : null}
       <PhotoMap
         imageUri={property.mapImageUri}
         calibration={cal}
@@ -296,7 +313,11 @@ export default function Features() {
               {sel.label ?? pretty(sel.type)} <Text style={{ color: t.textDim, fontSize: font.sm }}>({pretty(sel.type)})</Text>
             </Text>
             <Text style={{ color: t.textDim, fontSize: font.sm }}>
-              {sel.source === 'user' ? 'Added by you' : `Detected · ${Math.round(sel.confidence * 100)}% confidence`}
+              {sel.source === 'user'
+                ? 'Added by you'
+                : mock && sel.source === 'vision'
+                  ? `Sample (mock) · not from your photo${sel.userEdited ? ' · you edited it' : ''}`
+                  : `Detected · ${Math.round(sel.confidence * 100)}% confidence`}
               {sel.status === 'dismissed' ? ' · DISMISSED' : ''}
             </Text>
             {sel.rationale ? <Text style={{ color: t.textDim, fontSize: font.sm, marginTop: 4 }}>{sel.rationale}</Text> : null}
@@ -393,7 +414,7 @@ export default function Features() {
             </View>
           </View>
         ) : (
-          <Body dim>Tap any feature to review it. Confidence and USGS cross-checks are shown for detections.</Body>
+          <Body dim>{mock ? 'Tap any feature to review it. These features are sample data, so none of them has a confidence.' : 'Tap any feature to review it. Confidence and USGS cross-checks are shown for detections.'}</Body>
         )}
 
         <Label>PLACE A POINT</Label>

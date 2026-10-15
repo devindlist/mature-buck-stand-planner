@@ -1,5 +1,5 @@
-import { landdata, GridTerrain, sampleElevationGrid, type LandDataProvider, type LatLon, type Property, type TerrainModel, boundsOf } from '@msp/engine';
-import { cacheGet, cacheSet } from '../db/repos';
+import { landdata, GridTerrain, assessElevationGrid, sampleElevationGrid, type LandDataProvider, type LatLon, type Property, type TerrainModel, boundsOf } from '@msp/engine';
+import { cacheGet, cacheSet, dataEpoch } from '../db/repos';
 
 /**
  * Cached USGS 3DEP / NLCD / USDA CDL provider. Land data barely changes, so cache
@@ -8,11 +8,23 @@ import { cacheGet, cacheSet } from '../db/repos';
 const YEAR_MS = 365 * 24 * 3_600_000;
 const k = (kind: string, p: LatLon) => `${kind}:${p.lat.toFixed(5)},${p.lon.toFixed(5)}`;
 
-async function cached<T>(key: string, load: () => Promise<T | undefined>): Promise<T | undefined> {
-  const hit = await cacheGet<{ v: T | null }>(key, YEAR_MS);
+/**
+ * Read-through cache. A lookup that fails (timeout, offline, server error) is never stored; by
+ * default it reads as "no data" (`undefined`). With `rethrow` it rejects instead, so the elevation
+ * grid can tell a failed request from a real gap and refuse to cache a grid full of transient holes.
+ */
+async function cached<T>(key: string, load: () => Promise<T | undefined>, opts: { rethrow?: boolean } = {}): Promise<T | undefined> {
+  const epoch = dataEpoch();
+  const hit = await cacheGet<{ v: T | null }>(key, YEAR_MS).catch(() => undefined);
   if (hit) return hit.v ?? undefined;
-  const v = await load().catch(() => undefined);
-  if (v !== undefined) await cacheSet(key, { v });
+  let v: T | undefined;
+  try {
+    v = await load();
+  } catch (e) {
+    if (opts.rethrow) throw e;
+    return undefined;
+  }
+  if (v !== undefined) await cacheSet(key, { v }, epoch).catch(() => undefined);
   return v;
 }
 
@@ -20,7 +32,7 @@ export function createLandDataProvider(): LandDataProvider {
   // CDL is published the winter after harvest; use last year's layer.
   const cdlYear = new Date().getFullYear() - 1;
   return {
-    elevationAt: (p) => cached(k('3dep', p), () => landdata.fetchElevationM(p)),
+    elevationAt: (p) => cached(k('3dep', p), () => landdata.fetchElevationM(p), { rethrow: true }),
     landCoverAt: (p) => cached(k('nlcd', p), () => landdata.fetchNlcdClass(p)),
     cropAt: (p) => cached(k(`cdl${cdlYear}`, p), async () => {
       const code = await landdata.fetchCdlCode(p, cdlYear);
@@ -53,8 +65,31 @@ function toTerrain(grid: ElevationGridJson | undefined): GridTerrain | undefined
   }
 }
 
-/** 3DEP elevation grid over the property for thermals (cached; ~400 points at 60 m). */
-export async function loadTerrain(property: Property): Promise<TerrainModel | undefined> {
+/**
+ * Longest "Generate plan" waits for terrain. Past this the plan goes ahead without it (thermals fall
+ * back to the mapped ridges and draws), the same as when the grid cannot be fetched at all. The
+ * forecast has its own cap; the property's elevation must not be allowed to hold the spinner longer.
+ */
+export const TERRAIN_BUDGET_MS = 12_000;
+
+/**
+ * 3DEP elevation grid over the property for thermals (~400 points at 60 m). Never waits longer than
+ * `budgetMs`. A complete grid is cached for a year; one with timed-out or failed samples is used for
+ * this plan only (its good points are already cached one by one, so a retry only asks for the rest).
+ */
+export async function loadTerrain(property: Property, budgetMs = TERRAIN_BUDGET_MS): Promise<TerrainModel | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const giveUp = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), budgetMs);
+  });
+  try {
+    return await Promise.race([loadTerrainWithin(property, budgetMs), giveUp]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function loadTerrainWithin(property: Property, budgetMs: number): Promise<TerrainModel | undefined> {
   const cal = property.calibration;
   if (!cal?.originGeo) return undefined;
   const pts = property.boundary?.length ? property.boundary : property.features.flatMap((f) => f.geometry.points);
@@ -64,14 +99,18 @@ export async function loadTerrain(property: Property): Promise<TerrainModel | un
   const half = Math.min(1500, Math.max(b.maxX - b.minX, b.maxY - b.minY) / 2);
   const cell = Math.max(40, (2 * half) / 20);
   const key = `grid:${property.id}:${Math.round(center.x)}:${Math.round(center.y)}:${Math.round(half)}`;
+  const epoch = dataEpoch();
   // A cached grid is validated exactly like a fresh one before it is trusted offline.
   const fromCache = toTerrain(await cacheGet<ElevationGridJson>(key, YEAR_MS).catch(() => undefined));
   if (fromCache) return fromCache;
   try {
-    const grid = await sampleElevationGrid(createLandDataProvider(), cal.originGeo, center, half, cell);
+    // Stop sampling a second before the outer cap so a nearly complete grid can still be used.
+    const sample = await sampleElevationGrid(createLandDataProvider(), cal.originGeo, center, half, cell, { deadlineMs: Math.max(1_000, budgetMs - 1_000) });
+    const { usable, cacheable } = assessElevationGrid(sample, MIN_GRID_COVERAGE);
+    if (!usable) return undefined;
+    const grid: ElevationGridJson = { origin: sample.origin, cellM: sample.cellM, cols: sample.cols, rows: sample.rows, values: sample.values };
     const terrain = toTerrain(grid);
-    if (!terrain) return undefined;
-    await cacheSet(key, grid).catch(() => undefined);
+    if (terrain && cacheable) await cacheSet(key, grid, epoch).catch(() => undefined);
     return terrain;
   } catch {
     return undefined;

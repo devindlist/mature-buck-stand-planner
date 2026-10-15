@@ -8,7 +8,8 @@
     "ios": "expo run:ios",
     "android": "expo run:android",
     "typecheck": "tsc --noEmit",
-    "align": "expo install --fix"
+    "align": "expo install --fix",
+    "test": "node --test \"src/**/*.test.ts\""
   },
   "dependencies": {
     "@maplibre/maplibre-react-native": "^10.0.0",

@@ -16,7 +16,7 @@ React Native (Expo) app for iOS and Android. Offline-first, one-handed, glove-fr
 |---|---|
 | Project structure (npm workspaces) | `apps/mobile`, `packages/engine`, `server/vision-proxy` |
 | Data models: Property, Stand, Hunt, Sighting, WeatherSnapshot, Plan (+ habitat, routes, scores) | `packages/engine/src/models.ts` |
-| Rules engine, pure TypeScript, unit-tested (101 tests) | `packages/engine/src` → [docs/RULES.md](docs/RULES.md) |
+| Rules engine, pure TypeScript, unit-tested (165 tests) | `packages/engine/src` → [docs/RULES.md](docs/RULES.md) |
 | Map-photo calibration (north, scale bar, two reference points) | engine `calibration/`, app `app/calibrate.tsx` |
 | Vision analysis: Claude via your proxy, plus mock mode | engine `vision/`, `server/vision-proxy`, app `src/services/vision.ts` |
 | USGS 3DEP / NLCD / CDL cross-check of detections | engine `vision/crossCheck.ts`, `landdata/usgs.ts` |
@@ -31,7 +31,7 @@ Requirements: Node 22.18+ (the engine and proxy run TypeScript natively via Node
 
 ```bash
 npm install                       # all workspaces
-npm test                          # rules engine: 101 tests, no device needed
+npm test                          # engine (165) + proxy (15) + app pure modules (19), no device needed
 
 # Mobile app (needs a dev build: MapLibre and SQLCipher are native modules)
 cd apps/mobile

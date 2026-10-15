@@ -3,7 +3,6 @@ import {
   nws,
   derivePhase,
   sunTimes,
-  legalHours,
   addMinutes,
   AM_HOLD_MIN,
   PM_SETTLE_MIN,
@@ -12,7 +11,8 @@ import {
   type SeasonPhase,
   type WeatherSnapshot,
 } from '@msp/engine';
-import { cacheGet, cacheSet, lastWeather } from '../db/repos';
+import { cacheGet, cacheSet, dataEpoch, lastWeather } from '../db/repos';
+import { legalHoursSetting, legalMinutesSetting } from './planning';
 import { uid } from '../utils/format';
 
 /**
@@ -27,13 +27,13 @@ const NWS_REQUEST_TIMEOUT_MS = 10_000;
 export const FORECAST_DEADLINE_MS = 25_000;
 
 /**
- * The sit window the forecast is fetched for. Uses the same phase as the planner
- * (the hunter's override when set), so every hour of the planned sit has hourly winds.
+ * The sit window the forecast is fetched for. Uses the same phase and the same legal-light
+ * offsets (the hunter's Settings) as the planner, so every hour of the planned sit has hourly winds.
  */
 export function sitBounds(date: string, window: HuntWindow, loc: LatLon, stateCode: string, phaseOverride?: SeasonPhase): { start: string; end: string } {
   const phase = derivePhase(date, stateCode, phaseOverride).phase;
   const sun = sunTimes(date, loc.lat, loc.lon);
-  const legal = legalHours(sun);
+  const legal = legalHoursSetting(sun);
   return window === 'AM'
     ? { start: legal.start, end: addMinutes(sun.sunrise, AM_HOLD_MIN[phase]) }
     : { start: addMinutes(sun.sunset, -PM_SETTLE_MIN[phase]), end: legal.end };
@@ -75,21 +75,47 @@ function withDeadline<T>(p: Promise<T>, ms: number): Promise<T> {
   return Promise.race([p, deadline]).finally(() => clearTimeout(timer));
 }
 
+/** Cache key of a sit's forecast. The legal-light offsets set how many hours are fetched, so they are part of it. */
+function cacheKeyFor(tag: string): string {
+  const { legalMinutesBefore, legalMinutesAfter } = legalMinutesSetting();
+  return `nws:${tag}|${legalMinutesBefore}/${legalMinutesAfter}`;
+}
+
+/**
+ * The last forecast downloaded for this sit (up to 18 hours old), without touching the network.
+ * Lets a screen show something real at once while the live request is still running.
+ */
+export async function cachedForecast(loc: LatLon, date: string, window: HuntWindow, stateCode: string, phaseOverride?: SeasonPhase): Promise<WeatherSnapshot | undefined> {
+  const phase = derivePhase(date, stateCode, phaseOverride).phase;
+  const tag = forecastKey(loc, date, window, phase);
+  const hit = await cacheGet<WeatherSnapshot>(cacheKeyFor(tag), STALE_OK_MS).catch(() => undefined);
+  return hit ? tagForecast(hit, tag) : undefined;
+}
+
 /**
  * Forecast for one sit. `phaseOverride` (optional) is the hunter's phase override; it
  * changes how long the sit runs, so it changes the hours fetched and the cache key.
  */
-export async function loadForecast(loc: LatLon, date: string, window: HuntWindow, stateCode: string, phaseOverride?: SeasonPhase): Promise<WeatherResult> {
+export async function loadForecast(
+  loc: LatLon,
+  date: string,
+  window: HuntWindow,
+  stateCode: string,
+  phaseOverride?: SeasonPhase,
+  /** `maxAgeMs`: how old a cached forecast may be before a new one is fetched (default 45 min). Hunt mode's wind poll can pass less. */
+  opts: { maxAgeMs?: number } = {},
+): Promise<WeatherResult> {
+  const epoch = dataEpoch();
   const phase = derivePhase(date, stateCode, phaseOverride).phase;
   const tag = forecastKey(loc, date, window, phase);
-  const key = `nws:${tag}`;
-  const fresh = await cacheGet<WeatherSnapshot>(key, FORECAST_TTL_MS);
+  const key = cacheKeyFor(tag);
+  const fresh = await cacheGet<WeatherSnapshot>(key, Math.min(FORECAST_TTL_MS, Math.max(0, opts.maxAgeMs ?? FORECAST_TTL_MS)));
   if (fresh) return { snapshot: tagForecast(fresh, tag), status: 'ok' };
   const { start, end } = sitBounds(date, window, loc, stateCode, phaseOverride);
   try {
     const userAgent = String(Constants.expoConfig?.extra?.nwsUserAgent ?? 'MatureBuckStandPlanner/0.1');
     const { snapshot } = await withDeadline(nws.fetchSnapshot(loc, start, end, { userAgent, timeoutMs: NWS_REQUEST_TIMEOUT_MS }), FORECAST_DEADLINE_MS);
-    await cacheSet(key, snapshot);
+    await cacheSet(key, snapshot, epoch);
     return { snapshot: tagForecast(snapshot, tag), status: 'ok' };
   } catch (e) {
     const stale = await cacheGet<WeatherSnapshot>(key, STALE_OK_MS);

@@ -12,6 +12,7 @@ import { ensureLocationPermission, quickLocation, tap, windPollMinutes } from '.
 import { endActiveHunt, resetCheckIn, setObservedWind, startHunt } from '../src/services/huntSession';
 import { androidApiLevel, isAndroid, openAppSettings } from '../src/services/platform';
 import { loadForecast } from '../src/services/weather';
+import { observedWindFresh } from '../src/services/windDisplay';
 import { fmtDuration, fmtTime, minutesUntil, uid } from '../src/utils/format';
 import { font, RADIUS, SPACE, TOUCH } from '../src/theme/theme';
 
@@ -35,15 +36,15 @@ const SIGHTINGS: Array<{ m: Maturity; label: string }> = [
 const BEHAVIORS: Array<{ b: SightingBehavior; label: string }> = [
   { b: 'feeding', label: 'Feeding' },
   { b: 'traveling', label: 'Walking' },
-  { b: 'bedded', label: 'Bedded' },
+  { b: 'bedded', label: 'Bedded (not here)' },
   { b: 'chasing', label: 'Chasing' },
   { b: 'scraping', label: 'Scraping' },
   { b: 'rubbing', label: 'Rubbing' },
 ];
 
 const WIND_DIRS = [0, 45, 90, 135, 180, 225, 270, 315];
-/** A tapped "wind at the tree" stays authoritative this long. */
-const OBSERVED_WIND_TTL_MIN = 180;
+/** Hunt mode's wind poll must not be served a forecast older than this (the normal cache keeps one for 45 min). */
+const HUNT_FORECAST_MAX_AGE_MS = 10 * 60_000;
 
 type DialStatus = 'good' | 'caution' | 'bad';
 const RANK: Record<DialStatus, number> = { good: 0, caution: 1, bad: 2 };
@@ -182,7 +183,7 @@ export default function HuntMode() {
     const loc = plan?.inputs.location ?? property?.calibration?.originGeo;
     if (!plan || !property || !loc) return;
     try {
-      const r = await loadForecast(loc, plan.inputs.date, plan.inputs.window, property.stateCode, plan.inputs.phaseOverride);
+      const r = await loadForecast(loc, plan.inputs.date, plan.inputs.window, property.stateCode, plan.inputs.phaseOverride, { maxAgeMs: HUNT_FORECAST_MAX_AGE_MS });
       setLive({ snapshot: r.snapshot, offline: r.status === 'offline', fetchedAt: Date.now() });
       // Keep the global wind badge in step, but only when it shows this same sit.
       const s = useAppStore.getState();
@@ -252,7 +253,7 @@ export default function HuntMode() {
 
   // ---- Live wind alert: wind at the tree / forecast for this hour vs. this stand's dial. --
   const plannedWeather = plan?.inputs.weather;
-  const observedFresh = session.observedWindFromDeg !== undefined && session.observedWindAt && minutesUntil(session.observedWindAt, now) > -OBSERVED_WIND_TTL_MIN;
+  const observedFresh = session.observedWindFromDeg !== undefined && observedWindFresh(session.observedWindAt, now);
   const forecast = forecastWindNow(live?.snapshot ?? plannedWeather, now);
   const yourPlanned = plannedWeather && !plannedWeather.placeholder && (plannedWeather.overriddenFields.includes('windFromDeg') || plannedWeather.source === 'manual') ? plannedWeather.windFromDeg : undefined;
   const winds: Array<{ key: string; label: string; fromDeg: number; status: DialStatus }> = [];
@@ -311,6 +312,11 @@ export default function HuntMode() {
     if (!lastSighting) return;
     tap(settings.haptics);
     const next: Sighting = { ...lastSighting, ...patch };
+    // The log records where the HUNTER sat, not where the deer was. A bedded deer is somewhere else:
+    // keeping the stand's position would tell the planner there is a bed under this very stand
+    // (and the engine turns a mature buck "bedded" at a position into buck bedding).
+    if (next.behavior === 'bedded') delete next.position;
+    else if (patch.behavior !== undefined && lastSighting.behavior === 'bedded' && next.position === undefined) next.position = rec?.stand.position ?? session.standPosition;
     try {
       await saveSighting(next);
       setLastSighting(next);

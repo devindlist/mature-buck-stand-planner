@@ -12,6 +12,7 @@ import { useAppStore, defaultRangeFor, normalizeSettings } from '../src/state/st
 import { getSetting, latestPlan, listProperties, restoreMapPhotoCache } from '../src/db/repos';
 import { getDb, resetEncryptedStorage, StorageOpenError } from '../src/db/database';
 import { cancelAllScheduled, ensureCheckInChannel, onCheckInNotificationTap } from '../src/services/checkin';
+import { deleteOfflineMaps } from '../src/services/dataReset';
 import { closeStaleHunt, restoreActiveHunt, takeAutoEndedHunt } from '../src/services/huntSession';
 import { font, SPACE } from '../src/theme/theme';
 
@@ -140,6 +141,8 @@ function Shell() {
             // a check-in / OVERDUE alert would fire later for a hunt that no longer exists.
             void cancelAllScheduled()
               .catch(() => undefined)
+              // Offline basemap packs show where the property is, so they go too (best effort).
+              .then(() => deleteOfflineMaps().catch(() => undefined))
               .then(() => resetEncryptedStorage())
               .then(async (report) => {
                 await boot();

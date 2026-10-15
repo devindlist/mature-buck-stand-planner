@@ -70,3 +70,18 @@ test('land-data requests time out (rejecting, so nothing is cached as no-data)',
   assert.equal(await fetchElevationM(p, ok), 300);
   assert.equal(await fetchElevationM(p, ok, 30), 300);
 });
+
+test('a service error or rate limit rejects (a failed request), while a 404 or a no-data answer is "no data"', async () => {
+  const p = { lat: 41.85, lon: -93.3 };
+  const status = (code: number, body = '{}') => (async () => new Response(body, { status: code })) as unknown as typeof fetch;
+  for (const code of [500, 503, 429, 408]) {
+    await assert.rejects(fetchElevationM(p, status(code)), /Elevation service error/, `elevation ${code}`);
+    await assert.rejects(fetchNlcdClass(p, status(code)), /Land cover service error/, `nlcd ${code}`);
+    await assert.rejects(fetchCdlCode(p, 2025, status(code)), /Crop layer service error/, `cdl ${code}`);
+  }
+  assert.equal(await fetchElevationM(p, status(404)), undefined);
+  assert.equal(await fetchNlcdClass(p, status(400)), undefined);
+  assert.equal(await fetchCdlCode(p, 2025, status(404)), undefined);
+  // EPQS answers 200 with -1000000 where it has no data: that is a real "no data", not a failure.
+  assert.equal(await fetchElevationM(p, status(200, JSON.stringify({ value: -1000000 }))), undefined);
+});

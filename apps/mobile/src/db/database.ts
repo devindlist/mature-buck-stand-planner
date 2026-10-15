@@ -216,7 +216,16 @@ export interface WipeReport {
  * left in a backup can never be decrypted), then opens a new, empty encrypted database
  * with a new key.
  */
+/**
+ * Changes every time the hunter's data is erased. Network lookups note it when they start and
+ * skip their cache write if it moved, so a request that was in flight during "Delete all data"
+ * can't write its coordinates (the cache keys carry them) back into the fresh database.
+ */
+let dataEpochN = 0;
+export const dataEpoch = (): number => dataEpochN;
+
 export async function resetEncryptedStorage(): Promise<WipeReport> {
+  dataEpochN++;
   let photosRemoved = true;
   if (!resetting) {
     resetting = (async () => {
@@ -250,6 +259,7 @@ export async function resetEncryptedStorage(): Promise<WipeReport> {
  * also cancel alarms and offline map packs (services/dataReset.ts).
  */
 export async function wipeAllData(): Promise<WipeReport> {
+  dataEpochN++;
   try {
     return await resetEncryptedStorage();
   } catch {

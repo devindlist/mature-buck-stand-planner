@@ -1,5 +1,5 @@
 import type { Calibration, CropType, CrossCheckNote, ISODate, LatLon, MapFeature, Vec } from '../models.ts';
-import { add, geometryCentroid, normalize, pointAlong, polylineLength, projectOntoPolyline, rotate, scale, sub } from '../geo/geometry.ts';
+import { DEG, add, geometryCentroid, normalize, pointAlong, polylineLength, projectOntoPolyline, rotate, scale, sub } from '../geo/geometry.ts';
 import { localToGeo } from '../geo/localFrame.ts';
 
 /**
@@ -23,6 +23,10 @@ const MIN_RELIEF_M = 1.5;
 
 type Elev = (v: Vec) => Promise<number | undefined>;
 
+/** The note for a landform whose elevation could not be read. A failed lookup is not "no coverage". */
+const NO_ELEVATION: CrossCheckNote = { source: '3DEP', agrees: null, detail: 'No elevation coverage.', confidenceDelta: 0 };
+const ELEVATION_LOOKUP_FAILED = 'Elevation lookup failed (offline or timed out), so this was not checked.';
+
 async function crossProfile(elev: Elev, p: Vec, dir: Vec, offsetM: number): Promise<{ center: number; a: number; b: number } | null> {
   const [center, a, b] = await Promise.all([elev(p), elev(add(p, scale(dir, offsetM))), elev(add(p, scale(dir, -offsetM)))]);
   if (center === undefined || a === undefined || b === undefined) return null;
@@ -42,7 +46,7 @@ async function checkLinearLandform(f: MapFeature, elev: Elev, high: boolean): Pr
     const ok = high ? prof.center - Math.max(prof.a, prof.b) >= -0.5 && prof.center - Math.min(prof.a, prof.b) >= MIN_RELIEF_M : Math.min(prof.a, prof.b) - prof.center >= -0.5 && Math.max(prof.a, prof.b) - prof.center >= MIN_RELIEF_M;
     if (ok) agree++;
   }
-  if (total === 0) return { source: '3DEP', agrees: null, detail: 'No elevation coverage.', confidenceDelta: 0 };
+  if (total === 0) return { ...NO_ELEVATION };
   const agrees = agree / total >= 0.6;
   return {
     source: '3DEP',
@@ -68,7 +72,7 @@ async function checkSaddle(f: MapFeature, elev: Elev, ridges: MapFeature[]): Pro
   for (const ax of axes) {
     const ridgeProf = await crossProfile(elev, p, normalize(ax), 80);
     const crossProf = await crossProfile(elev, p, rotate(normalize(ax), 90), 80);
-    if (!ridgeProf || !crossProf) return { source: '3DEP', agrees: null, detail: 'No elevation coverage.', confidenceDelta: 0 };
+    if (!ridgeProf || !crossProf) return { ...NO_ELEVATION };
     const higherAlong = Math.min(ridgeProf.a, ridgeProf.b) - ridgeProf.center >= MIN_RELIEF_M;
     const lowerAcross = crossProf.center - Math.max(crossProf.a, crossProf.b) >= MIN_RELIEF_M;
     if (higherAlong && lowerAcross) return { source: '3DEP', agrees: true, detail: 'Elevation confirms a saddle: higher along the ridge, lower to each side.', confidenceDelta: AGREE };
@@ -82,7 +86,7 @@ async function checkBench(f: MapFeature, elev: Elev): Promise<CrossCheckNote> {
   const perp = rotate(tangent, 90);
   const near = await crossProfile(elev, point, perp, 15);
   const far = await crossProfile(elev, point, perp, 55);
-  if (!near || !far) return { source: '3DEP', agrees: null, detail: 'No elevation coverage.', confidenceDelta: 0 };
+  if (!near || !far) return { ...NO_ELEVATION };
   const flatSlope = Math.abs(near.a - near.b) / 30;
   const outerSlope = (Math.abs(far.a - near.a) + Math.abs(near.b - far.b)) / 80;
   const agrees = outerSlope > 0.08 && flatSlope < outerSlope * 0.5;
@@ -143,14 +147,45 @@ export function cropFromCdl(code: number, cdlYear: number, date: ISODate): { cro
   return null;
 }
 
+/** NLCD and CDL are 30 m rasters: a finer location than that buys no accuracy, only privacy loss. */
+export const LANDDATA_SNAP_M = 30;
+
+/**
+ * Snap a point to the centre of its ~30 m cell on a fixed lat/lon grid. Land-cover and crop
+ * lookups (MRLC, the GMU CropScape server) are made at this precision, not at the feature's exact
+ * centroid, so a bedding area, food plot or saddle is not pinned down more precisely than the data
+ * itself is. Two centroids in one cell share one request point (and one cached answer).
+ */
+export function snapToLandGrid(p: LatLon, cellM = LANDDATA_SNAP_M): LatLon {
+  const latStep = cellM / 111_320;
+  const lat = (Math.floor(p.lat / latStep) + 0.5) * latStep;
+  const lonStep = latStep / Math.max(0.05, Math.cos(lat * DEG));
+  const lon = (Math.floor(p.lon / lonStep) + 0.5) * lonStep;
+  return { lat, lon };
+}
+
 export async function crossCheckFeatures(features: MapFeature[], cal: Calibration, provider: LandDataProvider, date: ISODate): Promise<MapFeature[]> {
   if (!cal.originGeo) return features;
   const origin = cal.originGeo;
   const cache = new Map<string, Promise<number | undefined>>();
-  const elev: Elev = (v) => {
+  /** Points whose elevation request failed or timed out (as opposed to answering "no data"). */
+  const failedKeys = new Set<string>();
+  /** Set when the feature being checked read a failed point. Features are checked one at a time. */
+  let featureLookupFailed = false;
+  const elev: Elev = async (v) => {
     const key = `${Math.round(v.x / 5)}:${Math.round(v.y / 5)}`;
-    if (!cache.has(key)) cache.set(key, provider.elevationAt(localToGeo(v, origin)).catch(() => undefined));
-    return cache.get(key) as Promise<number | undefined>;
+    if (!cache.has(key)) {
+      cache.set(
+        key,
+        provider.elevationAt(localToGeo(v, origin)).catch(() => {
+          failedKeys.add(key);
+          return undefined;
+        }),
+      );
+    }
+    const r = await (cache.get(key) as Promise<number | undefined>);
+    if (r === undefined && failedKeys.has(key)) featureLookupFailed = true;
+    return r;
   };
   const ridges = features.filter((f) => f.type === 'ridge' && f.status === 'active');
   const out: MapFeature[] = [];
@@ -160,12 +195,15 @@ export async function crossCheckFeatures(features: MapFeature[], cal: Calibratio
       continue;
     }
     const notes: CrossCheckNote[] = [];
+    featureLookupFailed = false;
     try {
       if (f.type === 'ridge' && f.geometry.points.length >= 2) notes.push(await checkLinearLandform(f, elev, true));
       if ((f.type === 'draw' || f.type === 'creek') && f.geometry.points.length >= 2) notes.push(await checkLinearLandform(f, elev, false));
       if (f.type === 'saddle') notes.push(await checkSaddle(f, elev, ridges));
       if (f.type === 'bench' && f.geometry.points.length >= 2) notes.push(await checkBench(f, elev));
-      const c = localToGeo(geometryCentroid(f.geometry), origin);
+      // A failed elevation request reads "not checked", never "no coverage" (the ground may be fine).
+      if (featureLookupFailed) for (const n of notes) if (n.source === '3DEP' && n.agrees === null) n.detail = ELEVATION_LOOKUP_FAILED;
+      const c = snapToLandGrid(localToGeo(geometryCentroid(f.geometry), origin));
       if (provider.landCoverAt && ['thick_cover', 'ag_field', 'food_plot', 'mast_timber', 'water'].includes(f.type)) {
         const code = await provider.landCoverAt(c);
         const n = code === undefined ? null : nlcdCheck(f.type, code);
@@ -193,23 +231,107 @@ export async function crossCheckFeatures(features: MapFeature[], cal: Calibratio
   return out;
 }
 
-/** Sample a regular elevation grid for thermals (fed to GridTerrain). */
+/** Requests in flight at once while sampling an elevation grid. */
+export const ELEVATION_GRID_CONCURRENCY = 16;
+/** Overall budget for one grid. Without it a dead connection stalls rows x per-request timeout (minutes). */
+export const ELEVATION_GRID_DEADLINE_MS = 30_000;
+
+export interface ElevationGridOptions {
+  /** Requests in flight at once (default ELEVATION_GRID_CONCURRENCY). */
+  concurrency?: number;
+  /** Stop requesting after this long and return what has arrived (default ELEVATION_GRID_DEADLINE_MS). */
+  deadlineMs?: number;
+}
+
+export interface ElevationGridSample {
+  origin: Vec;
+  cellM: number;
+  cols: number;
+  rows: number;
+  /** Meters, row 0 at the south edge. NaN is a node without an elevation. */
+  values: number[];
+  /**
+   * How many NaN nodes are a failure (the request rejected or timed out, or was never sent because the
+   * deadline passed). Those are transient and worth retrying. The other NaN nodes are the service
+   * answering "no data here", which is permanent.
+   */
+  failed: number;
+  /** The overall deadline ended the sampling before every node was answered. */
+  deadlineHit: boolean;
+}
+
+/**
+ * Sample a regular elevation grid for thermals (fed to GridTerrain).
+ *
+ * Nodes are requested row by row through a small pool (`concurrency` in flight), so one slow request
+ * never holds up a whole row, and the whole grid is bounded by `deadlineMs`: when it passes, no more
+ * requests are sent and the grid is returned with what has arrived. Failures are counted separately from
+ * "no data" so the caller can refuse to cache a grid with transient holes.
+ */
 export async function sampleElevationGrid(
   provider: LandDataProvider,
   originGeo: LatLon,
   center: Vec,
   halfSizeM: number,
   cellM: number,
-): Promise<{ origin: Vec; cellM: number; cols: number; rows: number; values: number[] }> {
+  options: ElevationGridOptions = {},
+): Promise<ElevationGridSample> {
   const n = Math.max(2, Math.round((2 * halfSizeM) / cellM) + 1);
   const origin = sub(center, { x: halfSizeM, y: halfSizeM });
-  const values: number[] = [];
-  for (let r = 0; r < n; r++) {
-    const row = await Promise.all(
-      Array.from({ length: n }, (_, c) => provider.elevationAt(localToGeo(add(origin, { x: c * cellM, y: r * cellM }), originGeo)).catch(() => undefined)),
-    );
-    for (const v of row) values.push(v ?? NaN);
+  const total = n * n;
+  const values: number[] = new Array<number>(total).fill(NaN);
+  const answered = new Uint8Array(total);
+  const pool = Math.max(1, Math.min(total, Math.floor(options.concurrency ?? ELEVATION_GRID_CONCURRENCY)));
+  const deadlineMs = options.deadlineMs ?? ELEVATION_GRID_DEADLINE_MS;
+  let next = 0;
+  let stopped = deadlineMs <= 0;
+  let deadlineHit = stopped;
+  let nAnswered = 0;
+
+  const worker = async (): Promise<void> => {
+    while (!stopped) {
+      const i = next++;
+      if (i >= total) return;
+      try {
+        const v = await provider.elevationAt(localToGeo(add(origin, { x: (i % n) * cellM, y: Math.floor(i / n) * cellM }), originGeo));
+        if (stopped) return; // the grid was already handed back; a late answer must not change it
+        if (typeof v === 'number' && Number.isFinite(v)) values[i] = v;
+        answered[i] = 1;
+        nAnswered++;
+      } catch {
+        // A rejected or timed-out request is a failure (left unanswered), not "no data".
+      }
+    }
+  };
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<void>((resolve) => {
+    if (!stopped) {
+      timer = setTimeout(() => {
+        deadlineHit = true;
+        resolve();
+      }, deadlineMs);
+    } else resolve();
+  });
+  try {
+    await Promise.race([Promise.all(Array.from({ length: pool }, worker)), deadline]);
+  } finally {
+    clearTimeout(timer);
+    stopped = true;
   }
-  return { origin, cellM, cols: n, rows: n, values };
+  return { origin, cellM, cols: n, rows: n, values, failed: total - nAnswered, deadlineHit: deadlineHit && nAnswered < total };
 }
 
+/**
+ * Can this sampled grid drive thermals, and is it safe to cache? A grid is usable once enough nodes
+ * have an elevation (a few holes just fall back to mapped features there). It is cacheable only when
+ * every hole is a real "no data" answer: a grid with timed-out or failed nodes would keep those
+ * holes for as long as it is cached, long after the connection is back.
+ */
+export function assessElevationGrid(grid: Pick<ElevationGridSample, 'values' | 'failed'>, minCoverage: number): { coverage: number; usable: boolean; cacheable: boolean } {
+  let have = 0;
+  for (const v of grid.values) if (Number.isFinite(v)) have++;
+  const coverage = grid.values.length ? have / grid.values.length : 0;
+  const usable = coverage >= minCoverage;
+  return { coverage, usable, cacheable: usable && grid.failed === 0 };
+}

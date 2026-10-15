@@ -8,7 +8,7 @@
     "server/*"
   ],
   "scripts": {
-    "test": "npm run test -w @msp/engine && npm run test -w @msp/vision-proxy",
+    "test": "npm run test -w @msp/engine && npm run test -w @msp/vision-proxy && npm run test -w @msp/mobile",
     "typecheck": "npm run typecheck -w @msp/engine && npm run typecheck -w @msp/mobile && npm run typecheck -w @msp/vision-proxy",
     "mobile": "npm run start -w @msp/mobile",
     "proxy": "npm run dev -w @msp/vision-proxy"

@@ -215,6 +215,17 @@ test('planning is fast enough for a phone (< 3 s here)', () => {
   assert.ok(Date.now() - t0 < 3000);
 });
 
+test('planning stays fast on the heavy path: NW wind forces the wind-shift fallback backup (generous bound, < 3 s)', () => {
+  // The fallback builds extra route planners, one per assumed wind; measured at 90-500 ms on the fixture.
+  for (const win of ['AM', 'PM'] as const) {
+    const t0 = Date.now();
+    const plan = planHunt({ property: fixtureProperty(), inputs: inputs({ window: win, weather: weather({ windFromDeg: 315 }) }), now: NOW });
+    const ms = Date.now() - t0;
+    assert.ok(plan.backup?.assumedWindFromDeg !== undefined, `${win}: the timed plan really took the wind-shift fallback`);
+    assert.ok(ms < 3000, `${win}: planned in ${ms} ms`);
+  }
+});
+
 test('a wind-shift-only backup is never a plain GO for today', () => {
   // Leave only stands that fail today's NW wind plus one survivor, forcing the hypothetical backup path.
   const plan = planHunt({ property: fixtureProperty(), inputs: inputs(), now: NOW });

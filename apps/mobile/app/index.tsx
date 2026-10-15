@@ -7,7 +7,7 @@ import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Body, Card, Disclaimer, Label, Screen } from '../src/components/ui';
 import { ConditionsStrip } from '../src/components/ConditionsStrip';
 import { StatusIcon } from '../src/components/Icons';
-import { defaultSit, planLocation, useApproxLocations } from '../src/services/planning';
+import { conditionsConfirmed, defaultSit, planLocation, useApproxLocations } from '../src/services/planning';
 import { setSetting } from '../src/db/repos';
 import { fmtDate, sitOrder } from '../src/utils/format';
 import { font, SPACE, TOUCH } from '../src/theme/theme';
@@ -39,7 +39,7 @@ export default function Home() {
   const hunt = useAppStore((s) => s.hunt);
   const set = useAppStore((s) => s.set);
   useForecast();
-  const { current } = useForecastFreshness();
+  const { current, loading } = useForecastFreshness();
   const approx = useApproxLocations((s) => (property ? s.byProperty[property.id] : undefined));
 
   // Home focus and app resume: never sit on a date that has already passed.
@@ -59,7 +59,8 @@ export default function Home() {
     <Screen title="Stand Planner" scroll={false}>
       <ScrollView contentContainerStyle={{ padding: SPACE, paddingBottom: 40 }}>
         <ConditionsStrip
-          weather={current ? weather : null}
+          // Not another sit's weather, and not placeholder defaults while the forecast is still on its way.
+          weather={current && !(loading && weather?.placeholder && !conditionsConfirmed(draft.overrides)) ? weather : null}
           location={loc}
           date={draft.date}
           stateCode={property?.stateCode ?? 'IA'}

@@ -1,5 +1,7 @@
 import type { Hunt, Plan, PlanCard, PressureEvent, Property, Sighting, WeatherSnapshot } from '@msp/engine';
-import { getDb, MAPS_DIR } from './database';
+import { dataEpoch, getDb, MAPS_DIR } from './database';
+
+export { dataEpoch };
 import { ensureMapPhotoFile, deletePropertyPhoto, photoToStore, resolvePhotoUri, toStoredPhotoUri, writePhotoRow } from './mapPhotos';
 
 /** Thin JSON-document repositories over the encrypted SQLite database. */
@@ -147,7 +149,9 @@ export async function cacheGet<T>(key: string, maxAgeMs: number): Promise<T | un
   return parse<T>(row.value);
 }
 
-export async function cacheSet(key: string, value: unknown): Promise<void> {
+/** `epoch`: the dataEpoch() noted when the lookup started; a write after the data was erased is dropped. */
+export async function cacheSet(key: string, value: unknown, epoch?: number): Promise<void> {
+  if (epoch !== undefined && epoch !== dataEpoch()) return;
   const db = await getDb();
   await db.runAsync('INSERT OR REPLACE INTO cache (key, fetched_at, value) VALUES (?, ?, ?)', key, Date.now(), JSON.stringify(value));
 }

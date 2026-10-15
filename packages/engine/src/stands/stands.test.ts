@@ -527,3 +527,16 @@ test('a parking-spot scent problem is shared only when most stands starting ther
   assert.equal(findSharedAccessHazards([pair(true)]).hazards.length, 0, 'a single stand is never "shared"');
   assert.equal(findSharedAccessHazards([pair(false), pair(false)]).hazards.length, 0);
 });
+
+test('a truck parked in the same routing cell as the stand still gets a real two-point route', () => {
+  const property = fixtureProperty();
+  const habitat = { bedding: [], food: [], corridors: [] };
+  const grid = buildCostGrid({ property, habitat, setbackM: 100, windFromDeg: 0, windSpeedMph: 10, window: 'PM' }, 'entry');
+  const a = { x: 0, y: 0 };
+  const b = { x: grid.cell * 0.2, y: grid.cell * 0.1 }; // well inside one cell of a
+  const r = astar(grid, a, b)!;
+  assert.ok(r, 'route found');
+  assert.deepEqual(r.path[0], a, 'starts at the truck');
+  assert.deepEqual(r.path[r.path.length - 1], b, 'ends at the stand');
+  assert.ok(r.path.length >= 2);
+});

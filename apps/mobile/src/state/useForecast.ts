@@ -1,7 +1,7 @@
 import { useCallback, useEffect } from 'react';
 import { derivePhase, type LatLon, type Property } from '@msp/engine';
 import { useAppStore, type PlanDraft } from './store';
-import { forecastKey, forecastKeyOf, loadForecast, manualSnapshot, tagForecast } from '../services/weather';
+import { cachedForecast, forecastKey, forecastKeyOf, loadForecast, manualSnapshot, tagForecast } from '../services/weather';
 import { loadApproxLocations, planLocation, useApproxLocations } from '../services/planning';
 
 /**
@@ -13,6 +13,11 @@ import { loadApproxLocations, planLocation, useApproxLocations } from '../servic
  * Every request is numbered and only the newest one may write to the store, so a slow
  * response for a sit the hunter has already moved away from can never overwrite the
  * forecast for the sit they are looking at.
+ *
+ * A request never leaves the store empty while it runs: the screen is seeded at once with
+ * the last forecast downloaded for this sit, or with placeholder values the hunter confirms
+ * or edits. A slow or missing network (the usual case at the truck) therefore never blocks
+ * Plan Hunt; the real forecast replaces the seed when it arrives.
  */
 
 /** Which sit the current draft needs a forecast for (see forecastKey). */
@@ -24,6 +29,15 @@ export function forecastKeyFor(property: Property, draft: Pick<PlanDraft, 'date'
 
 let latestRequest = 0;
 let inflight: { key: string; promise: Promise<void> } | null = null;
+
+/**
+ * Forgets any request in progress: whatever it returns is dropped instead of written to the
+ * store. Delete-all-data calls this, so a forecast for a deleted property cannot reappear.
+ */
+export function resetForecastState(): void {
+  latestRequest += 1;
+  inflight = null;
+}
 
 /**
  * Loads the forecast for the store's current property and draft. Requests for the
@@ -54,6 +68,12 @@ export function refreshForecast(force = false): Promise<void> {
     }
     set({ weatherStatus: 'loading', weatherError: undefined });
     try {
+      // Seed the store for THIS sit unless it already holds a forecast for it (a Retry keeps its own).
+      if (forecastKeyOf(useAppStore.getState().weather) !== key) {
+        const seed = tagForecast((await cachedForecast(loc, date, window, property.stateCode, phaseOverride)) ?? (await manualSnapshot()), key);
+        if (!current()) return;
+        set({ weather: seed });
+      }
       const r = await loadForecast(loc, date, window, property.stateCode, phaseOverride);
       if (!current()) return;
       set({ weather: r.snapshot, weatherStatus: r.status, weatherError: r.note });

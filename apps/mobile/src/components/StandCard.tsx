@@ -1,11 +1,12 @@
 import React from 'react';
 import { Pressable, ScrollView, Text, View } from 'react-native';
-import { compass16, mToYds, type StandRecommendation } from '@msp/engine';
+import { compass16, mToYds, type Decision, type StandRecommendation } from '@msp/engine';
 import { useTheme } from '../theme/ThemeContext';
 import { font, RADIUS, SPACE, TOUCH } from '../theme/theme';
 import { StatusChip, Label, BigButton } from './ui';
 import { StatusIcon } from './Icons';
 import { WindDialView } from './WindDialView';
+import { confirmHunt, huntGate, NO_GO_SUBLABEL } from '../services/huntGate';
 import { fmtTime } from '../utils/format';
 
 /** One swipeable card per stand. Score and each sub-score are tappable for the "why". */
@@ -18,6 +19,7 @@ export function StandCard({
   onDismiss,
   onHunt,
   busy,
+  weatherDecision,
 }: {
   rec: StandRecommendation;
   /** Overrides the "#rank · name" title (e.g. for the hunter's own stands). */
@@ -29,12 +31,15 @@ export function StandCard({
   onHunt: () => void;
   /** A re-plan is running: Move, Dismiss and Hunt wait so a second change can't race the first. */
   busy?: boolean;
+  /** The plan's weather decision. A weather no-go asks for the same confirmation as a stand no-go. */
+  weatherDecision?: Decision;
 }) {
   const t = useTheme();
   const title = titleOverride ?? (rec.isBackup ? `Backup · ${rec.stand.name}` : `#${rec.rank} · ${rec.stand.name}`);
   const shot = rec.shotPlan;
   const assumed = rec.assumedWindFromDeg;
   const noShot = shot.lanes.filter((l) => l.status === 'no_shot');
+  const gate = huntGate(rec, weatherDecision);
   return (
     <View style={{ width, paddingHorizontal: SPACE / 2 }}>
       <ScrollView style={{ backgroundColor: t.surface, borderRadius: RADIUS, borderWidth: 1, borderColor: rec.isBackup ? t.textDim : t.border }} contentContainerStyle={{ padding: SPACE + 2 }}>
@@ -173,11 +178,13 @@ export function StandCard({
 
         <Text style={{ color: t.textDim, fontSize: font.xs, marginTop: 8 }}>{rec.confidence.factors.join(' ')}</Text>
 
+        {/* A no-go is never a dead button: it turns red and asks for "I understand, start anyway" (same as the plan card). */}
         <BigButton
           label="Hunt this stand"
-          onPress={onHunt}
-          disabled={rec.decision.status === 'no_go' || busy}
-          sublabel={rec.decision.status === 'no_go' ? 'No-go today' : busy ? 'Re-planning…' : undefined}
+          kind={gate.noGo ? 'danger' : 'primary'}
+          onPress={() => confirmHunt(gate, rec.stand.name, onHunt)}
+          disabled={busy}
+          sublabel={busy ? 'Re-planning…' : gate.noGo ? NO_GO_SUBLABEL : undefined}
           style={{ marginTop: SPACE }}
         />
         <View style={{ flexDirection: 'row', gap: 8 }}>

@@ -14,7 +14,7 @@ import {
   type SeasonPhase,
   type WeaponType,
 } from '@msp/engine';
-import { useAppStore } from '../src/state/store';
+import { DEFAULT_RANGE_YDS, MAX_RANGE_YDS, useAppStore } from '../src/state/store';
 import { useForecast, useForecastFreshness } from '../src/state/useForecast';
 import { useTheme } from '../src/theme/ThemeContext';
 import { BigButton, Body, Card, Label, Screen, Segmented, Stepper } from '../src/components/ui';
@@ -25,7 +25,6 @@ import { addDays, fmtDate, fmtTime, todayLocal } from '../src/utils/format';
 import { font, RADIUS, SPACE, TOUCH } from '../src/theme/theme';
 
 const WEAPONS: readonly WeaponType[] = ['bow', 'crossbow', 'muzzleloader', 'shotgun', 'rifle'];
-const DEFAULT_RANGE: Record<WeaponType, number> = { bow: 30, crossbow: 40, muzzleloader: 125, shotgun: 100, rifle: 250, handgun: 100 };
 const DIRS = Array.from({ length: 16 }, (_, i) => i * 22.5);
 
 /** Every precip type the rules know, so freezing rain (a climbing NO-GO) is never entered as sleet. */
@@ -84,7 +83,11 @@ export default function PlanHunt() {
   // Placeholder = no forecast: values are defaults until the hunter sets or confirms them.
   const unconfirmed = !!weather?.placeholder && !conditionsConfirmed(o);
   const windEdited = o.windFromDeg !== undefined || o.windSpeedMph !== undefined || o.windGustMph !== undefined;
-  const ready = !!weather && fresh.current && !fresh.loading;
+  // The screen is seeded at once (last downloaded forecast, else placeholder values), so it is never
+  // empty. Generate waits for the live forecast ONLY while the hunter has not vouched for every
+  // gating value; with those set or confirmed, the forecast cannot change the gate and nothing waits on it.
+  const manualReady = conditionsConfirmed(o);
+  const ready = !!weather && fresh.current && (!fresh.loading || manualReady);
 
   /** Approximate location for a photo-only map: the phone's GPS, taken at or near the property. */
   const takeGpsLocation = async () => {
@@ -213,7 +216,7 @@ export default function PlanHunt() {
         <Segmented options={['AM', 'PM'] as const} value={draft.window} onChange={(w) => setDraft({ window: w })} labels={{ AM: `AM${sun ? ` · ↑ ${fmtTime(sun.sunrise)}` : ''}`, PM: `PM${sun ? ` · ↓ ${fmtTime(sun.sunset)}` : ''}` }} />
 
         <Label>
-          WIND {unconfirmed ? '(defaults: not a forecast)' : windEdited ? '(edited by you)' : weather?.source === 'nws' ? '(NWS forecast)' : '(entered by you)'}
+          WIND {unconfirmed ? '(defaults: not a forecast)' : windEdited ? '(edited by you)' : weather?.source === 'nws' ? (fresh.loading ? '(last downloaded forecast, updating)' : '(NWS forecast)') : '(entered by you)'}
         </Label>
         <Card style={!fresh.current ? { opacity: 0.55 } : undefined}>
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
@@ -242,7 +245,9 @@ export default function PlanHunt() {
           <Stepper label="Gusts" value={Math.round(gust)} onChange={(v) => setOverride({ windGustMph: v })} unit="mph" max={80} badge={edited('windGustMph')} />
           {Object.keys(o).length ? <BigButton label={weather?.placeholder ? 'Clear my entries' : 'Reset to forecast'} kind="ghost" onPress={clearOverrides} /> : null}
           {fresh.loading ? (
-            <Text style={{ color: t.status.caution, fontSize: font.sm }}>Getting the forecast for this sit…</Text>
+            <Text style={{ color: t.status.caution, fontSize: font.sm }}>
+              Getting the forecast for this sit…{manualReady ? ' You have set the conditions yourself, so you can plan now.' : ' To plan without waiting, set or confirm the conditions below.'}
+            </Text>
           ) : !fresh.current ? (
             <Text style={{ color: t.status.caution, fontSize: font.sm }}>These values are from another sit. Get the forecast for this one before you plan.</Text>
           ) : weatherStatus !== 'ok' ? (
@@ -322,8 +327,8 @@ export default function PlanHunt() {
         </Card>
 
         <Label>WEAPON & YOUR EFFECTIVE RANGE</Label>
-        <Segmented options={WEAPONS} value={draft.weaponType} onChange={(w) => setDraft({ weaponType: w, rangeYds: DEFAULT_RANGE[w] })} labels={{ bow: 'Bow', crossbow: 'Xbow', muzzleloader: 'Muzz', shotgun: 'Shotgun', rifle: 'Rifle' }} />
-        <Stepper label="Effective range (your honest max)" value={draft.rangeYds} onChange={(v) => setDraft({ rangeYds: v })} step={5} min={10} max={400} unit="yds" />
+        <Segmented options={WEAPONS} value={draft.weaponType} onChange={(w) => setDraft({ weaponType: w, rangeYds: DEFAULT_RANGE_YDS[w] })} labels={{ bow: 'Bow', crossbow: 'Xbow', muzzleloader: 'Muzz', shotgun: 'Shotgun', rifle: 'Rifle' }} />
+        <Stepper label="Effective range (your honest max)" value={draft.rangeYds} onChange={(v) => setDraft({ rangeYds: v })} step={5} min={10} max={MAX_RANGE_YDS[draft.weaponType]} unit="yds" />
 
         <Pressable accessibilityRole="button" accessibilityState={{ expanded: advanced }} onPress={() => setAdvanced((v) => !v)} style={{ minHeight: TOUCH, justifyContent: 'center' }}>
           <Text style={{ color: t.accent, fontWeight: '800' }}>{advanced ? '▾' : '▸'} Phase & setback overrides</Text>
@@ -367,7 +372,7 @@ export default function PlanHunt() {
             label="Generate plan"
             loading={busy}
             disabled={!ready}
-            sublabel={!ready ? 'Waiting for the forecast for this sit…' : unconfirmed ? 'Confirm the conditions first' : undefined}
+            sublabel={!ready ? 'Waiting for the forecast, or confirm the conditions yourself' : unconfirmed ? 'Confirm the conditions first' : undefined}
             onPress={() => void generate()}
             style={{ minHeight: 72, marginTop: SPACE }}
           />

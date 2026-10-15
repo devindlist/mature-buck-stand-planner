@@ -40,9 +40,23 @@ async function fetchWithTimeout<T>(fetchFn: FetchFn, url: string, timeoutMs: num
   }
 }
 
+/**
+ * A server error, rate limit or request timeout is the service failing, not "no data here". It
+ * rejects (like a timeout) so callers can tell the two apart: a hole from a failed request is worth
+ * retrying and must never be cached as if the ground had no elevation.
+ */
+function isTransientFailure(res: Response): boolean {
+  return res.status >= 500 || res.status === 429 || res.status === 408;
+}
+
+function readIfOk<T>(res: Response, what: string, read: (res: Response) => Promise<T | undefined>): Promise<T | undefined> {
+  if (isTransientFailure(res)) throw new Error(`${what} service error (HTTP ${res.status})`);
+  return res.ok ? read(res) : Promise.resolve(undefined);
+}
+
 export async function fetchElevationM(p: LatLon, fetchFn: FetchFn = fetch, timeoutMs = LANDDATA_TIMEOUT_MS): Promise<number | undefined> {
   const url = `${EPQS_URL}?x=${p.lon.toFixed(6)}&y=${p.lat.toFixed(6)}&wkid=4326&units=Meters&includeDate=false`;
-  return fetchWithTimeout(fetchFn, url, timeoutMs, async (res) => (res.ok ? parseEpqs(await res.json()) : undefined));
+  return fetchWithTimeout(fetchFn, url, timeoutMs, async (res) => readIfOk(res, 'Elevation', async (r) => parseEpqs(await r.json())));
 }
 
 export function parseEpqs(body: unknown): number | undefined {
@@ -68,7 +82,7 @@ export async function fetchNlcdClass(p: LatLon, fetchFn: FetchFn = fetch, layer 
     x: '1',
     y: '1',
   });
-  return fetchWithTimeout(fetchFn, `${NLCD_WMS_URL}?${params.toString()}`, timeoutMs, async (res) => (res.ok ? parseNlcdFeatureInfo(await res.json()) : undefined));
+  return fetchWithTimeout(fetchFn, `${NLCD_WMS_URL}?${params.toString()}`, timeoutMs, async (res) => readIfOk(res, 'Land cover', async (r) => parseNlcdFeatureInfo(await r.json())));
 }
 
 export function parseNlcdFeatureInfo(body: unknown): number | undefined {
@@ -83,7 +97,7 @@ export function parseNlcdFeatureInfo(body: unknown): number | undefined {
 
 export async function fetchCdlCode(p: LatLon, year: number, fetchFn: FetchFn = fetch, timeoutMs = LANDDATA_TIMEOUT_MS): Promise<number | undefined> {
   const { x, y } = toConusAlbers(p);
-  return fetchWithTimeout(fetchFn, `${CDL_URL}?year=${year}&x=${x.toFixed(1)}&y=${y.toFixed(1)}`, timeoutMs, async (res) => (res.ok ? parseCdlValue(await res.text()) : undefined));
+  return fetchWithTimeout(fetchFn, `${CDL_URL}?year=${year}&x=${x.toFixed(1)}&y=${y.toFixed(1)}`, timeoutMs, async (res) => readIfOk(res, 'Crop layer', async (r) => parseCdlValue(await r.text())));
 }
 
 /** CropScape responds with an XML wrapper around a loose JSON-ish object: `{..., value: 5, category: "Soybeans", ...}`. */

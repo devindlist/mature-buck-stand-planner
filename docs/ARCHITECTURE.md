@@ -38,21 +38,36 @@
 
 **Verified here**
 
-- Engine: `tsc` strict (incl. `erasableSyntaxOnly`) and 101 passing tests covering calibration math, NOAA sun times vs. published values, moon phase, phase calendar, scent/thermal gate, habitat inference, candidate rules, A* routing, scoring caps, planner integration, vision parsing, 3DEP/NLCD/CDL cross-check, NWS parsing, Albers projection, and weather safety gates.
-- Proxy: request validation, auth parsing and rate limiting tested (4 tests).
-- App: type-checked for internal consistency (screens ↔ components ↔ store ↔ engine) against minimal stubs of the React Native/Expo APIs.
+- Engine: `tsc` strict (incl. `erasableSyntaxOnly`) and 165 passing tests covering calibration math, NOAA sun times vs. published values, moon phase, phase calendar, scent/thermal gate, habitat inference, candidate rules, A* routing (hard vs. soft blocks, unreachable stands, scent onto feeding deer), scoring caps, planner integration (worst-hour weather gate, wind-shift backups, legal-hour settings), vision parsing, 3DEP/NLCD/CDL cross-check (bounded concurrency, deadlines, failed-vs-no-data), NWS parsing, Albers projection, and weather safety gates.
+- Proxy: request validation (shared 5,000,000-character image cap), fail-closed auth policy, timeout clamping, request-cancellation watcher and rate limiting tested (15 tests).
+- App: type-checked for internal consistency (screens ↔ components ↔ store ↔ engine) against minimal stubs of the React Native/Expo APIs. The pure modules (wind-badge rules, the cancel helper, date/format helpers) have 19 tests that run in CI.
 
 **Not yet verified, because the npm registry was unreachable from the build environment**
 
 - The app has not been compiled against the real React Native / Expo / MapLibre type packages, bundled with Metro, or run on a device. Expect a short fix-up pass on first `npm install && npx expo run:ios`: library prop names (especially `@maplibre/maplibre-react-native` v10 `OfflineManager.createPack` options and `MapView` style props), and `expo-notifications` trigger shapes.
-- The proxy hasn't been type-checked against the installed `@anthropic-ai/sdk` or called live. It's pinned to `latest`; pin the resolved version after install.
+- The proxy typechecked against the real `@anthropic-ai/sdk` in CI (first push), but it has not been called live. It is pinned to a caret range with no lock file yet: run `npm install` once, make a live call, and commit `package-lock.json`.
 - Live endpoint shapes for MRLC NLCD GetFeatureInfo (layer name, property key) and CropScape should be confirmed against a real request; the parsers already accept the common variants.
+
+**Needs a real device to confirm** (library behavior that cannot be checked offline)
+
+- `@maplibre/maplibre-react-native` v10: the offline pack is built from a `file://` style URL; confirm both native downloaders accept it (fallback: host the style JSON at an https URL). Also check that the data-driven layers and stand labels render on the USGS map.
+- `expo-notifications` 0.29: the Android channel (vibrate, no sound) and iOS time-sensitive entitlement. A free Apple Personal Team build may need the entitlement removed (see the note in `src/services/checkin.ts`).
+- SQLCipher: the app refuses to open storage on a build without it (`PRAGMA cipher_version` is checked), so a plain-SQLite build fails loudly instead of storing in the clear. Confirm the schema 1 → 2 migration (map photos move into the encrypted database) on a build that has real v1 data.
+- Android 12+ exact alarms: `SCHEDULE_EXACT_ALARM` is declared but cannot be requested from JavaScript; without "Alarms & reminders" granted, check-in reminders can arrive late (Settings explains this).
+- `newArchEnabled` is on: check the Results and Hunt maps on both platforms.
+
+**Known limits**
+
+- Hunt mode's sighting log records where the hunter sat, not where the deer was; a "Bedded" detail drops the position so it can never place a bed under the stand. Deer position, heading on the map and trail-cam sightings are Phase 2.
+- Cancelling a map analysis stops the app waiting; the request to the proxy runs to its own deadline (the proxy cancels its Claude call when the phone disconnects or its deadline passes).
+- Map photos are stored at the picker's resolution (as base64 text inside the encrypted database); very large photos use a lot of memory when a map is rebuilt.
+- App-side logic that touches the phone (storage migration, hunt restore rules, alarms, screens) has no automated tests: it needs the real libraries. A Phase 2 task is a device-level smoke test and tests for those modules with the Expo libraries mocked.
 
 **Phase 2 candidates**
 
 - True dead-man's-switch check-in (server-sent SMS when overdue; phones can't auto-text).
 - On-device speech recognition for logs (Phase 1 uses keyboard dictation).
-- Rut calendars for other regions; per-state legal-hour tables.
+- Rut calendars for other regions; per-state legal-hour defaults (Phase 1 has hunter-editable minutes before sunrise / after sunset, default 30/30).
 - Camera-photo sighting import with EXIF time/location; sightings heat map.
 - Stand-level history analytics (which winds/phases produce mature-buck sightings).
 - Drag-to-move on the map (Phase 1 uses tap-to-place, which is easier with gloves).

@@ -1,12 +1,12 @@
 import React from 'react';
 import { ScrollView, Text, View } from 'react-native';
-import { assessWeather, derivePhase, legalHours, sunTimes, type LatLon, type SeasonPhase, type WeatherSnapshot } from '@msp/engine';
+import { assessWeather, derivePhase, sunTimes, type LatLon, type SeasonPhase, type WeatherSnapshot } from '@msp/engine';
 import { useTheme } from '../theme/ThemeContext';
 import { font, RADIUS } from '../theme/theme';
 import { fmtTime } from '../utils/format';
 import { LowConfidenceTag, StatusIcon } from './Icons';
-import { effectiveWeather } from '../services/planning';
-import type { PlanDraft } from '../state/store';
+import { effectiveWeather, legalHoursSetting } from '../services/planning';
+import { useAppStore, type PlanDraft } from '../state/store';
 
 /**
  * Home-screen conditions: temp, pressure trend, legal light, sun, phase, weather gate.
@@ -37,13 +37,16 @@ export function ConditionsStrip({
   approximateLocation?: boolean;
 }) {
   const t = useTheme();
+  // Legal light uses the hunter's own offsets (Settings), the same ones the plan is made with.
+  const legalMinutesBefore = useAppStore((s) => s.settings.legalMinutesBefore);
+  const legalMinutesAfter = useAppStore((s) => s.settings.legalMinutesAfter);
   let sun: ReturnType<typeof sunTimes> | null = null;
   try {
     sun = location ? sunTimes(date, location.lat, location.lon) : null;
   } catch {
     sun = null;
   }
-  const legal = sun ? legalHours(sun) : null;
+  const legal = sun ? legalHoursSetting(sun, { legalMinutesBefore, legalMinutesAfter }) : null;
   const phase = derivePhase(date, stateCode, phaseOverride);
   const w = weather ? effectiveWeather(weather, overrides ?? {}) : null;
   const gate = w ? assessWeather(w) : null;

@@ -37,6 +37,17 @@ import { effectiveSetback, noAccessZones } from './candidates.ts';
  * no other way in, at a steep cost, with those stretches flagged red ("get permission or mark a
  * different access point"). A parking spot a long way outside the line therefore gives a
  * caution, never a false "no legal route".
+ *
+ * Known limit of the endpoints (documented, not a bug to "fix" with a stricter check): the start
+ * (truck/gate) and goal (stand) cells are forced walkable, and the grid is 15 m or coarser, so the
+ * first and last hop of a walk can step across a fence line, a no-access zone edge or a stream
+ * narrower than a cell when the truck or the stand sits within about one cell of it. Everywhere else
+ * the "no route crosses a neighbor line, a no-access zone or water" guarantee holds. A stand INSIDE a
+ * no-access zone is rejected before routing (RoutePlanner.plan), and a stand on the far side of a
+ * fence from every start is caught by the hard blocks unless it is within that cell. This is
+ * deliberate: the hunter placed the truck and the stand exactly where they are, so we never move
+ * either to make a route fit, and we never call a stand unreachable over cell-edge fuzz. (See `astar`,
+ * where the endpoint cells are opened.)
  */
 
 export type WalkKind = 'entry' | 'exit';
@@ -446,6 +457,9 @@ export function astar(g: CostGrid, start: Vec, goal: Vec, penalty?: Float64Array
   for (let i = t; i !== -1; i = came[i]) cells.push(i);
   cells.reverse();
   const path = cells.map((i) => cellCenter(g, i));
+  // Truck and stand in the same routing cell: the cell list has one entry, so pinning both ends would
+  // overwrite the start with the goal and leave a one-point "route". Keep both ends.
+  if (path.length === 1) return { path: [start, goal], cost: gScore[t] };
   path[0] = start;
   path[path.length - 1] = goal;
   return { path, cost: gScore[t] };
