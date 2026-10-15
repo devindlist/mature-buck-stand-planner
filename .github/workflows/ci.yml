@@ -21,9 +21,11 @@ jobs:
         run: npm test --workspace @msp/engine
       - name: Link the engine package for the app's pure-module tests
         run: mkdir -p node_modules/@msp && ln -sfn ../../packages/engine node_modules/@msp/engine
-      - name: App tests (pure modules: wind badge, cancel helper, date/format helpers)
+      - name: App tests (pure modules - wind badge, cancel helper, date and format helpers)
         run: npm test --workspace @msp/mobile
       - name: Proxy tests
         run: npm test --workspace @msp/vision-proxy
+      - name: Which Anthropic SDK did npm resolve?
+        run: npm ls @anthropic-ai/sdk --workspace @msp/vision-proxy
       - name: Proxy typecheck
         run: npm run typecheck --workspace @msp/vision-proxy

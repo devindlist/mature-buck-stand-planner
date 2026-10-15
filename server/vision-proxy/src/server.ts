@@ -86,7 +86,10 @@ async function analyze(r: AnalyzeRequest, signal: AbortSignal) {
       // Server-side fallback: if a safety classifier declines, the API retries on
       // Anthropic's recommended fallback model inside the same call.
       betas: ['server-side-fallback-2026-07-01'],
-      fallbacks: 'default',
+      // `fallbacks: "default"` is newer than the typings of some SDK releases (they only know the array
+      // form), but the SDK sends the body as given. The cast keeps the typecheck independent of which
+      // release npm resolves; the proxy's behavior does not change.
+      fallbacks: 'default' as unknown as never,
       system: VISION_SYSTEM_PROMPT,
       // Spatial tracing benefits from more thinking than the Opus 5.5 default (medium).
       output_config: {
